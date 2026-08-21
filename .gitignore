@@ -1,0 +1,35 @@
+.*
+!/.gitignore
+
+# Python bytecode.  Regenerated on every import (and by py_compile), so a
+# tracked .pyc shows up as a modified file every time the app is run.
+__pycache__/
+*.pyc
+*.pyo
+
+# Cargo build output (cashterm_core/target/).  Rebuilt by ./build.sh via
+# maturin develop --release; libcashterm_core.d in there changes on literally
+# every build.  Matches a "target" directory at any depth, so a second crate
+# added later is covered without touching this file.
+target/
+
+# A venv in the repo is always a mistake — ./build.sh puts its own under
+# ~/.local/share/cash-terminal/.  Kept as a guard against one reappearing by
+# hand; nothing in the tree should ever need it.
+venv/
+
+# Compiled extension modules and object files.  The Rust core is a native .so
+# that maturin builds into the venv, and nothing compiled belongs in the repo.
+*.so
+*.o
+
+# Python packaging output.
+*.pyz
+*.egg-info/
+dist/
+
+# Editor and backup leftovers.
+*.bak
+*.orig
+*.rej
+*~

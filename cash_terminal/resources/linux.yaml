@@ -1,0 +1,128 @@
+colors:
+  primary:
+    background: "#000000"
+    foreground: "#B2B2B2"
+
+  cursor:
+    text: "#000000"
+    cursor: "#B2B2B2"
+
+  normal:
+    black:   "#000000"
+    red:     "#B21818"
+    green:   "#18B218"
+    yellow:  "#B26818"
+    blue:    "#1818B2"
+    magenta: "#B218B2"
+    cyan:    "#18B2B2"
+    white:   "#B2B2B2"
+
+  bright:
+    black:   "#7E7E7E"
+    red:     "#FF5454"
+    green:   "#54FF54"
+    yellow:  "#FFFF54"
+    blue:    "#5454FF"
+    magenta: "#FF54FF"
+    cyan:    "#54FFFF"
+    white:   "#FFFFFF"
+
+  dim:
+    black:   "#181818"
+    red:     "#650000"
+    green:   "#006500"
+    yellow:  "#655E00"
+    blue:    "#000065"
+    magenta: "#650065"
+    cyan:    "#006565"
+    white:   "#656565"
+
+  scrollbar:
+    background: "#999999"
+    foreground: "#E6E6E6"
+
+  tabs:
+    inactive_gradient_top: "#CACACA"
+    inactive_gradient_bottom: "#F1F1F1"
+    active_gradient_top: "#FBFBFB"
+    active_gradient_bottom: "#FFFFFF"
+    hover_gradient_top: "#DCDCDC"
+    hover_gradient_bottom: "#F6F6F6"
+    active_bar_color: "#6E9CBB"
+
+font:
+  normal:
+    family: Monospace
+#    family: Liberation Mono
+  size: 10
+
+scrollback_lines: 1000000
+
+# Background opacity: 0.0 = fully transparent, 1.0 = fully opaque
+background_opacity: 0.85
+
+# Tab list overlay (Ctrl+Up/Down or ▼ button).  Also editable in the settings
+# dialog (⚙ in the tab bar) → «Список вкладок».
+#   preview: true             — show highlighted tab while navigating the list
+#   activate_on_select: true  — activate tab on Ctrl release (false = require Enter)
+#   show_on_ctrl_tab: true    — show tab list overlay during Ctrl+Tab switching
+#   show_on_ctrl_tab_delay: 200 — delay (ms) before overlay appears; quick switch won't show it
+tab_list:
+  preview: true
+  activate_on_select: true
+  show_on_ctrl_tab: true
+  show_on_ctrl_tab_delay: 200
+
+# Environment variables set for the child shell process.
+# Override or add any env vars here.  Set value to null to remove a variable.
+env:
+  TERM: xterm-256color
+  COLORTERM: truecolor
+
+# Readline (inputrc) overrides applied via custom INPUTRC file.
+# Cash Terminal creates ~/.cash-terminal/inputrc that $includes system and
+# user inputrc files, then appends these overrides.
+# Set to false to disable (use system/user inputrc as-is, no overrides).
+inputrc:
+  enable-active-region: "off"
+
+# Startup window settings.  Also editable in the settings dialog
+# (⚙ in the tab bar) → «Запуск».
+#   maximized: true       — start fully maximized (default)
+#   window_size: "auto"   — when not maximized, let DE pick the size (default),
+#                           or set explicit "WIDTHxHEIGHT" e.g. "960x640"
+#   directory: "~"        — working directory for new windows/tabs;
+#                           use "~" for home or an absolute path
+#   follow_cwd: false     — true = a new tab starts in the working directory of
+#                           the tab it was opened from (wherever it was cd'ed
+#                           to), falling back to `directory` when that cannot
+#                           be read; false = always `directory`
+startup:
+  maximized: true
+  window_size: "auto"
+  directory: "~"
+  follow_cwd: false
+
+# What a new tab (Ctrl+T, "+" button, startup) does.  Also switchable in the
+# settings dialog (⚙ in the tab bar) → «Поведение».
+#   action: "command"  — run `command` right away (default, classic behaviour)
+#   action: "picker"   — show the session picker: local shell on top, then the
+#                        favourites and the 5 most recent SSH connections;
+#                        ↑↓ to choose, Enter to start, Esc closes the tab
+#   command: ""        — command line for action "command"; empty means
+#                        $SHELL as a login shell.  Any command line works,
+#                        e.g. "ssh -p 2222 user@host" or "/bin/zsh"
+# Ctrl+E raises the same picker over the current tab whatever this is set to.
+# There the choice is typed into the shell already running in that tab rather
+# than spawned, so leaving ssh drops back to the local shell; the local shell
+# row itself is not offered, since that shell is what is already running.
+# Favourites and the connection history live in their own file,
+# ~/.cash-terminal/connections.yaml (rewritten by the app — do not hand-edit
+# while the terminal is running).
+new_tab:
+  action: "command"
+  command: ""
+
+# Enable verbose debug logging to stdout (TEMP DEBUG prints)
+debug: false
+

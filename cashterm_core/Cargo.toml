@@ -1,0 +1,25 @@
+[package]
+name = "cashterm_core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust terminal core (alacritty_terminal) for Cash Terminal, via pyo3"
+
+# Stage-1 / Slice-1: Rust terminal core exposed to Python via pyo3.
+# Owns PTY + parser + alacritty grid; Python renders snapshots and feeds input.
+
+[lib]
+name = "cashterm_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+alacritty_terminal = "0.24"
+portable-pty = "0.8"
+# The "std" feature is not optional here: without it alacritty's tty/unix.rs
+# fails to build on a rustix OwnedFd vs std OwnedFd mismatch.
+rustix = { version = "0.38", features = ["std", "pty", "termios"] }
+
+[profile.release]
+opt-level = 3
+lto = true
