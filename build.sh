@@ -138,7 +138,11 @@ info "Rust core built and installed into the venv."
 info "Building zipapp ..."
 
 BUILD_TMP="$(mktemp -d)"
-PYZ_TMP="$(mktemp -u).pyz"
+# Staged next to the final file, not in /tmp, so the install below is a
+# same-filesystem rename.  /tmp is usually a separate mount (often tmpfs),
+# where mv silently degrades to copy-then-unlink and loses atomicity.
+mkdir -p "${DATA_DIR}"
+PYZ_TMP="${PYZ_PATH}.new.$$"
 trap 'rm -rf "${BUILD_TMP}" "${PYZ_TMP}"' EXIT
 
 # Stage the package + a top-level __main__.py entry point.
@@ -153,8 +157,11 @@ if __name__ == "__main__":
 EOF
 
 "${VENV_PY}" -m zipapp "${BUILD_TMP}" -o "${PYZ_TMP}" -p "/usr/bin/env python3"
-mkdir -p "${DATA_DIR}"
-cp "${PYZ_TMP}" "${PYZ_PATH}"
+# Install by rename, never by copying over the live file.  cp truncates the
+# destination and refills it, so a rebuild while the terminal is running (or
+# while another instance is starting) exposes a half-written archive.  rename()
+# is atomic: readers see either the whole old file or the whole new one.
+mv -f "${PYZ_TMP}" "${PYZ_PATH}"
 info "zipapp built → ${PYZ_PATH}"
 
 # ---- Install launcher wrapper ----

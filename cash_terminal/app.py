@@ -9,6 +9,16 @@ from . import config
 from .config import _load_yaml_config, _hex_to_rgba
 from .util import _translate_keyval_to_latin
 from .tab import TerminalTab
+# Imported eagerly even though both are only needed once a dialog is opened.
+# The app ships as a zipapp, and zipimport caches the archive's central
+# directory at startup but reopens the file by *path* for every later import.
+# Reinstalling (./build.sh) rewrites cash-terminal.pyz, so a deferred import in
+# an already-running instance seeks to a now-meaningless offset and dies with
+# "zipimport.ZipImportError: bad local file header".  Pulling in every module of
+# the package before the window is shown means the archive is never read again,
+# so a rebuild can no longer break a live session.
+from .settings import SettingsDialog
+from .connections_dialog import ConnectionsDialog
 
 
 # Reverse-DNS application identifier.  One constant because the same string has
@@ -813,7 +823,6 @@ class TerminalApp(Gtk.Application):
         if existing is not None:
             existing.present()
             return
-        from .settings import SettingsDialog
         dialog = SettingsDialog(self._win, self.apply_appearance_to_all_tabs,
                                 self._on_settings_closed)
         self._settings_dialog = dialog
@@ -825,7 +834,6 @@ class TerminalApp(Gtk.Application):
         if existing is not None:
             existing.present()
             return
-        from .connections_dialog import ConnectionsDialog
         dialog = ConnectionsDialog(self._win, self._on_connections_closed)
         self._connections_dialog = dialog
         dialog.present()

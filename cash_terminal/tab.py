@@ -805,6 +805,9 @@ class TerminalTab(Gtk.Box, SearchMixin, PasteMixin, InteractionMixin):
         item icons depend on the icon theme.  A plain Gtk.Popover holding flat
         Gtk.Button rows avoids both problems."""
         self._ctx_copy_btn = None
+        # Pending id of the deferred popup(), 0 when none is queued.  See
+        # _on_context_menu() for why more than one must never be in flight.
+        self._ctx_popup_id = 0
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         box.add_css_class("context-menu")
@@ -897,15 +900,35 @@ class TerminalTab(Gtk.Box, SearchMixin, PasteMixin, InteractionMixin):
         rect.width = 1
         rect.height = 1
         self._ctx_popover.set_pointing_to(rect)
+
+        # Already on screen: just move it.  Repeated right-clicks must not turn
+        # into popup() on a popover that is up — that is a second attempt to
+        # take a grab GTK thinks it already holds, and it is what produces
+        # "Broken accounting of active state for widget (GtkPopover)".
+        # Repositioning is also what the user means by right-clicking again.
+        if self._ctx_popover.get_visible():
+            return
+
         # Defer popup() to idle: showing the popover synchronously from inside
-        # the click-gesture handler leaves the gesture grab active and trips
-        # GTK's "Broken accounting of active state" warning.  Popping up after
-        # the gesture settles avoids it.
-        GLib.idle_add(self._ctx_popup_idle)
+        # the click-gesture handler leaves the gesture grab active and trips the
+        # same warning.  Popping up after the gesture settles avoids it.
+        #
+        # Only ever one deferred popup in flight.  Clicking fast enough to be
+        # read as a double/triple click still fires the press handler once per
+        # press, so the signal arrives several times before the first idle
+        # callback runs; without this guard each would queue its own popup() and
+        # all but the first would fire against an already-visible popover.  The
+        # rect set above belongs to the newest click, so dropping the extra
+        # callbacks loses nothing.
+        if self._ctx_popup_id:
+            return
+        self._ctx_popup_id = GLib.idle_add(self._ctx_popup_idle)
 
     def _ctx_popup_idle(self):
-        if getattr(self, "_ctx_popover", None) is not None:
-            self._ctx_popover.popup()
+        self._ctx_popup_id = 0
+        popover = getattr(self, "_ctx_popover", None)
+        if popover is not None and not popover.get_visible():
+            popover.popup()
         return GLib.SOURCE_REMOVE
 
     def bind_tab_label(self, label):
@@ -939,6 +962,12 @@ class TerminalTab(Gtk.Box, SearchMixin, PasteMixin, InteractionMixin):
         if self._title_timer_id:
             GLib.source_remove(self._title_timer_id)
             self._title_timer_id = 0
+
+        # Drop a deferred popup before tearing the popover down, or it fires
+        # afterwards and pops up a menu belonging to a closed tab.
+        if getattr(self, "_ctx_popup_id", 0):
+            GLib.source_remove(self._ctx_popup_id)
+            self._ctx_popup_id = 0
 
         # Tear down the right-click popover (parented on the terminal widget)
         # so GTK doesn't warn about finalizing a widget with children.
