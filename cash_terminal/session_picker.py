@@ -10,9 +10,15 @@ of the saved / recently used SSH connections.  The local shell row is dropped
 when `include_local` is False, which is what the Ctrl+E case wants: that tab
 is already running a local shell, so the row would do nothing.
 
-The list is a plain Gtk.ListBox, so Up/Down/Home/End and Enter come for free.
-Section headers ("Избранное", "История") are inserted as non-selectable rows
-so arrow navigation skips over them.
+The list is a plain Gtk.ListBox.  Section headers ("Избранное", "История") are
+inserted as non-selectable rows so arrow navigation skips over them.
+
+A search entry sits above the list and holds the keyboard focus from the moment
+the picker opens, so the list can be narrowed by just typing.  ↑↓ and Enter keep
+driving the list while it does; everything else is the entry's.  The filter
+matches the connection name and its command line, and never hides
+"Настроить список…" — a query that matches nothing must not also hide the way to
+fix the list.
 
 The widget owns no process: it only calls `on_choose(command)` where
 `command` is None for the local shell, or a full command line string
@@ -27,6 +33,7 @@ somewhere — a picker with no way out would be a trap.
 from gi.repository import Gtk, Gdk, GLib, Pango
 
 from . import connections
+from .util import scroll_into_view
 
 
 class SessionPicker(Gtk.Box):
@@ -46,9 +53,17 @@ class SessionPicker(Gtk.Box):
         # on_cancel() is Escape: the tab goes away instead of running anything.
         self._on_cancel = on_cancel
         self._done = False
-        # Selectable rows in display order — the keyboard navigation below
-        # works off this list rather than off the focused widget.
+        # Every selectable row in display order, and the subset the filter
+        # currently lets through.  Keyboard navigation works off _rows rather
+        # than off the focused widget, so it must never contain a hidden row.
+        self._all_rows = []
         self._rows = []
+        # The two explanatory rows, shown one at a time or not at all.
+        self._empty_row = None
+        self._no_match_row = None
+        # Coalesced scroll-to-row, see _scroll_to_row().
+        self._scroll_id = 0
+        self._scroll_row = None
         self.add_css_class("session-picker")
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -60,6 +75,16 @@ class SessionPicker(Gtk.Box):
         title.set_xalign(0.0)
         self.append(title)
 
+        # A plain Gtk.Entry, not Gtk.SearchEntry: the latter draws a magnifier
+        # and a clear button from the icon theme, and both come up blank on a
+        # system without adwaita-icon-theme — the same reason the Settings
+        # dialog builds its pickers out of plain widgets.
+        self._search = Gtk.Entry()
+        self._search.set_placeholder_text("Поиск…")
+        self._search.add_css_class("session-picker-search")
+        self._search.connect("changed", lambda _e: self._apply_filter())
+        self.append(self._search)
+
         self._list = Gtk.ListBox()
         self._list.set_selection_mode(Gtk.SelectionMode.BROWSE)
         self._list.add_css_class("session-picker-list")
@@ -70,13 +95,20 @@ class SessionPicker(Gtk.Box):
         # need two presses of the arrow key.  Headers set this way are not
         # rows at all and keyboard navigation ignores them completely.
         self._list.set_header_func(self._header_func)
+        # The filter reads a flag the rows carry, rather than re-deriving the
+        # match here: _apply_filter() has to build the navigation list anyway,
+        # and deciding it in one place keeps the two from disagreeing.
+        self._list.set_filter_func(lambda row: getattr(row, "_visible", True))
 
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroller.set_propagate_natural_height(True)
-        scroller.set_max_content_height(480)
-        scroller.set_child(self._list)
-        self.append(scroller)
+        self._scroller = Gtk.ScrolledWindow()
+        self._scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._scroller.set_propagate_natural_height(True)
+        self._scroller.set_max_content_height(480)
+        self._scroller.set_child(self._list)
+        _sadj = self._scroller.get_vadjustment()
+        if _sadj is not None:
+            _sadj.connect("changed", self._on_scroller_adj_changed)
+        self.append(self._scroller)
 
         esc = cancel_hint if on_cancel is not None else "локальная оболочка"
         hint = Gtk.Label(label=f"↑↓ — выбор,  Enter — запуск,  Esc — {esc}")
@@ -128,6 +160,10 @@ class SessionPicker(Gtk.Box):
         row._command = command
         row._action = action
         row._section = section
+        # What the search matches against: the visible name plus the command
+        # line, so "2222" or a hostname finds a favourite named "prod".
+        row._search_text = f"{title} {subtitle or ''}".lower()
+        row._visible = True
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         name = Gtk.Label(label=title)
@@ -143,20 +179,22 @@ class SessionPicker(Gtk.Box):
             box.append(sub)
         row.set_child(box)
         self._list.append(row)
-        self._rows.append(row)
+        self._all_rows.append(row)
         return row
 
     def _add_note(self, text):
         """A dimmed, unselectable row — an explanation, not a choice.
 
-        Kept out of self._rows, and unselectable so GTK's own navigation skips
-        it too: the arrow keys must never land on something Enter cannot run.
+        Kept out of self._all_rows, and unselectable so GTK's own navigation
+        skips it too: the arrow keys must never land on something Enter cannot
+        run.
         """
         row = Gtk.ListBoxRow()
         row.add_css_class("session-picker-row")
         row.set_selectable(False)
         row.set_activatable(False)
         row._section = None
+        row._visible = True
         label = Gtk.Label(label=text)
         label.set_xalign(0.0)
         label.add_css_class("session-picker-sub")
@@ -165,7 +203,10 @@ class SessionPicker(Gtk.Box):
         return row
 
     def _populate(self):
+        self._all_rows = []
         self._rows = []
+        self._empty_row = None
+        self._no_match_row = None
         if self._include_local:
             self._add_choice("Локальная оболочка", "", None)
 
@@ -194,15 +235,53 @@ class SessionPicker(Gtk.Box):
         # Without the local shell row the list can come up with nothing in it
         # at all (Ctrl+E on a machine with no saved connections yet).  Say so,
         # otherwise the picker looks broken rather than empty.
-        if not self._rows:
-            self._add_note("Нет сохранённых подключений")
+        if not self._all_rows:
+            self._empty_row = self._add_note("Нет сохранённых подключений")
+
+        # Built up front and hidden, rather than added and removed as the query
+        # changes: the list is only rebuilt when the favourites are edited, and
+        # touching its children on every keystroke would re-run the header
+        # function over the whole list each time.
+        self._no_match_row = self._add_note("Ничего не найдено")
 
         if self._on_edit is not None:
             self._add_choice("Настроить список…", "", None,
                              action="edit", section="")
 
-        if self._rows:
-            self._list.select_row(self._rows[0])
+        self._apply_filter()
+
+    # ------------------------------------------------------------- filtering
+    def _apply_filter(self):
+        """Re-run the search filter and fix up the selection.
+
+        Rebuilds self._rows so the arrow keys only ever walk visible rows, and
+        pulls the selection onto a visible row when the one it was on has just
+        been filtered out.
+        """
+        query = self._search.get_text().strip().lower()
+        for row in self._all_rows:
+            if getattr(row, "_action", "run") == "edit":
+                row._visible = True
+            else:
+                row._visible = (not query) or (query in row._search_text)
+        self._rows = [r for r in self._all_rows if r._visible]
+
+        # "Настроить список…" is always visible, so it cannot stand in for a
+        # match — count only real choices when deciding what to explain.
+        matches = [r for r in self._rows
+                   if getattr(r, "_action", "run") != "edit"]
+        if self._empty_row is not None:
+            self._empty_row._visible = not query
+        if self._no_match_row is not None:
+            self._no_match_row._visible = bool(query) and not matches
+        self._list.invalidate_filter()
+
+        selected = self._list.get_selected_row()
+        if selected is None or not getattr(selected, "_visible", False):
+            if self._rows:
+                self._select_index(0)
+            else:
+                self._list.unselect_all()
 
     def reload(self):
         """Rebuild the list after the favourites were edited."""
@@ -216,12 +295,18 @@ class SessionPicker(Gtk.Box):
 
     # -------------------------------------------------------------- focus
     def grab_picker_focus(self):
-        """Focus the list so the arrow keys work immediately."""
-        row = self._list.get_selected_row()
-        if row is not None:
-            row.grab_focus()
-        else:
-            self._list.grab_focus()
+        """Focus the search entry so typing narrows the list immediately.
+
+        The list needs no focus of its own: ↑↓ and Enter are routed here by the
+        window-level key controller regardless of what holds it (see
+        handle_key), which is what lets the entry keep it the whole time.
+        """
+        self._search.grab_focus()
+
+    def _search_has_focus(self):
+        """FOCUS_WITHIN, not has_focus(): a Gtk.Entry delegates the focus to an
+        inner GtkText, so the Entry itself never reports having it."""
+        return bool(self._search.get_state_flags() & Gtk.StateFlags.FOCUS_WITHIN)
 
     # ------------------------------------------------------------- events
     def handle_key(self, keyval):
@@ -231,25 +316,46 @@ class SessionPicker(Gtk.Box):
         (or any stray key the ListBox does not consume) moves the keyboard
         focus elsewhere and the arrows stop reaching the list.  The window
         controller sees every key regardless of focus, so navigation is done
-        here instead — and every other key is swallowed, because a tab that
-        has no shell yet has nothing to send them to.
+        here instead.
 
-        Always returns True: while the picker is up it owns the keyboard.
+        Returns True for the keys that drive the list, and False for the rest so
+        they reach the search entry — Home/End/←/→/BackSpace are the entry's
+        text keys now, and space types a space instead of launching.
         """
         if keyval == Gdk.KEY_Escape:
             self._cancel()
-        elif keyval in (Gdk.KEY_Up, Gdk.KEY_KP_Up):
+            return True
+        if keyval in (Gdk.KEY_Up, Gdk.KEY_KP_Up):
             self._move(-1)
-        elif keyval in (Gdk.KEY_Down, Gdk.KEY_KP_Down):
+            return True
+        if keyval in (Gdk.KEY_Down, Gdk.KEY_KP_Down):
             self._move(1)
-        elif keyval in (Gdk.KEY_Home, Gdk.KEY_KP_Home):
-            self._select_index(0)
-        elif keyval in (Gdk.KEY_End, Gdk.KEY_KP_End):
-            self._select_index(len(self._rows) - 1)
-        elif keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
             row = self._list.get_selected_row()
             if row is not None:
                 self._on_row_activated(self._list, row)
+            return True
+        if keyval == Gdk.KEY_Tab:
+            # Nothing else in the picker is worth focusing, and letting Tab move
+            # the focus off the entry would silently stop the search working.
+            return True
+
+        if self._search_has_focus():
+            return False
+
+        # The picker is an overlay: a click beside it lands on the terminal
+        # underneath and takes the focus with it.  Returning False now would
+        # type the character into that shell, so pull the focus back first and
+        # apply the character here — the alternative is losing the first
+        # keystroke after every stray click.
+        self._search.grab_focus()
+        unichar = Gdk.keyval_to_unicode(keyval)
+        if unichar:
+            char = chr(unichar)
+            if char.isprintable():
+                self._search.set_text(self._search.get_text() + char)
+                self._search.set_position(-1)
         return True
 
     def _move(self, delta):
@@ -263,14 +369,64 @@ class SessionPicker(Gtk.Box):
         self._select_index(idx + delta)
 
     def _select_index(self, idx):
-        """Select row `idx`, clamped.  Also pulls the focus back into the list,
-        so the arrows restore it after a click landed on the terminal."""
+        """Select row `idx`, clamped, and scroll it into view."""
         if not self._rows:
             return
         idx = max(0, min(len(self._rows) - 1, idx))
         row = self._rows[idx]
         self._list.select_row(row)
-        row.grab_focus()  # scrolls the row into view as a side effect
+        self._scroll_to_row(row)
+
+    def _scroll_to_row(self, row):
+        """Reveal `row` without touching the keyboard focus.
+
+        row.grab_focus() used to do this as a side effect, but the focus belongs
+        to the search entry now and taking it away would swallow the next
+        character typed.
+
+        Deferred to idle because the row's position is not known yet at the two
+        moments this matters: on the first open the scroller has no allocation,
+        and straight after invalidate_filter() the rows have not been laid out
+        again.  Coalesced to one pending callback so holding ↓ does not queue one
+        per keypress; the newest row wins.
+
+        The request survives a failed attempt: idle callbacks all run before the
+        frame that allocates the scroller, so the first try can find a page size
+        of 0 and have nothing to measure against.  The adjustment's "changed"
+        signal then finishes the job once layout lands.
+        """
+        self._scroll_row = row
+        if self._scroll_id:
+            return
+        self._scroll_id = GLib.idle_add(self._scroll_idle)
+
+    def _scroll_idle(self):
+        self._scroll_id = 0
+        self._try_scroll()
+        return GLib.SOURCE_REMOVE
+
+    def _on_scroller_adj_changed(self, _adj):
+        """Layout is happening — retry the pending scroll once it has finished.
+
+        Deliberately not measuring right here: "changed" arrives in the middle of
+        the layout pass, when the scroller has its geometry but the rows inside
+        have not been placed, so compute_bounds() would hand back a stale
+        rectangle and the bogus result would count as a success.  An idle runs
+        between frames, after the allocation is done.
+        """
+        if self._scroll_row is None:
+            return
+        if self._scroll_id:
+            return
+        self._scroll_id = GLib.idle_add(self._scroll_idle)
+
+    def _try_scroll(self):
+        """Scroll to the pending row, dropping the request only on success."""
+        row = self._scroll_row
+        if row is None:
+            return
+        if scroll_into_view(self._scroller, row, margin=4):
+            self._scroll_row = None
 
     def _on_key(self, _ctrl, keyval, _keycode, _state):
         # Fallback for the case where the window controller is not in play

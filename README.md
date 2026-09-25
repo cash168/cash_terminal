@@ -283,7 +283,7 @@ directory (venv + zipapp), and the installed icons / `.desktop` file.
 | `cash_terminal/search.py` | `SearchMixin` — search bar, match finding, navigation, highlight push |
 | `cash_terminal/paste.py` | `PasteMixin` — paste sanitization and confirmation |
 | `cash_terminal/interaction.py` | `InteractionMixin` — alt-screen detection, cursor hiding, click-to-position |
-| `cash_terminal/session_picker.py` | `SessionPicker` — list of what a tab can run (local shell, favourites, recent SSH); used for `new_tab.action: picker` and Ctrl+E |
+| `cash_terminal/session_picker.py` | `SessionPicker` — searchable list of what a tab can run (local shell, favourites, recent SSH); used for `new_tab.action: picker` and Ctrl+E |
 | `cash_terminal/connections.py` | Favourites + SSH history store, kept in `~/.cash-terminal/connections.yaml` (rewritten by the app, separate from `linux.yaml`) |
 | `cash_terminal/connections_dialog.py` | `ConnectionsDialog` — editor for those favourites; promotes history entries into them |
 | `cash_terminal/settings.py` | `SettingsDialog` — live-preview editor (colors/presets/font/opacity, startup, behaviour, tab list, env) |

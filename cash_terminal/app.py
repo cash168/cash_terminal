@@ -97,6 +97,11 @@ class TerminalApp(Gtk.Application):
         self._tab_list_overlay_widget = None
         self._tab_list_overlay_parent = None
         self._tab_list_buttons = []
+        # Pending id of the deferred scroll-to-selection, 0 when none, plus the
+        # request itself — it outlives a failed attempt (see _queue_tab_list_scroll).
+        self._tab_list_scroll_id = 0
+        self._tab_list_scroll_pending = False
+        self._tab_list_scroll_tries = 0
         # Close-confirmation via bottom bar (not dialog)
         self._close_confirm_pending = False
 
@@ -360,6 +365,43 @@ class TerminalApp(Gtk.Application):
                 min-width: 300px;
             }}
 
+            /* Our own bar instead of the stock one.  The popup hangs just inside
+               the terminal's own scrollbar, so a default-looking scrollbar here
+               read as a second system scrollbar sitting next to the first.  The
+               trough, the steppers and the light background are all removed and
+               what is left is a dark blue strip that belongs to the popup.
+               AUTOMATIC policy still hides it completely when the list fits. */
+            .tab-list-overlay scrollbar {{
+                background: transparent;
+                border: none;
+                min-width: 10px;
+            }}
+
+            .tab-list-overlay scrollbar trough {{
+                background: rgba(255, 255, 255, 0.05);
+                border: none;
+                border-radius: 5px;
+                margin: 2px;
+            }}
+
+            .tab-list-overlay scrollbar slider {{
+                background: #2F4A6E;
+                border-radius: 5px;
+                min-height: 28px;
+                /* Inset via a transparent border so the slider reads as a thin
+                   strip without shrinking the hit area GTK gives it. */
+                border: 2px solid transparent;
+                background-clip: padding-box;
+            }}
+
+            .tab-list-overlay scrollbar slider:hover {{
+                background: #3C5A82;
+            }}
+
+            .tab-list-overlay scrollbar slider:active {{
+                background: #6E9CBB;
+            }}
+
             .tab-list-item {{
                 padding: 4px 14px;
                 min-height: 26px;
@@ -473,6 +515,23 @@ class TerminalApp(Gtk.Application):
                 font-weight: bold;
                 font-size: 13px;
                 margin-bottom: 8px;
+            }}
+
+            /* Spelled out rather than left to the stock theme, which paints a
+               light entry on this dark popup. */
+            .session-picker-search {{
+                background: rgba(28, 31, 36, 0.98);
+                color: #e0e0e0;
+                border: 1px solid rgba(100, 110, 120, 0.5);
+                border-radius: 4px;
+                padding: 4px 8px;
+                margin-bottom: 8px;
+                font-size: 13px;
+                box-shadow: none;
+            }}
+
+            .session-picker-search:focus {{
+                border-color: #6E9CBB;
             }}
 
             .session-picker-list {{
@@ -953,8 +1012,12 @@ class TerminalApp(Gtk.Application):
         # the focus.  A click next to the picker (it is an overlay — the click
         # lands on the terminal underneath) used to move the focus away and
         # kill the arrow keys for good; now focus does not matter, and the
-        # picker pulls it back on the first arrow press.  Ctrl/Alt shortcuts
-        # still work, so a tab without a shell is never a dead end.
+        # picker pulls it back on the first key.  Ctrl/Alt shortcuts still work,
+        # so a tab without a shell is never a dead end.
+        #
+        # handle_key returns False for keys that belong to the picker's search
+        # entry, which lets them propagate to it normally — it only claims the
+        # ones that drive the list.
         if tab is not None and getattr(tab, "_picker", None) is not None:
             if not ctrl and not alt:
                 return tab._picker.handle_key(keyval)
@@ -1465,13 +1528,30 @@ class TerminalApp(Gtk.Application):
 
         cur_page = self._notebook.get_current_page()
 
-        # Build overlay box
-        overlay_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        # The rows go in a plain box, which is then wrapped in a scroller: with
+        # enough tabs open the box grows taller than the window, and an overlay
+        # child is simply clipped at the window edge — the bottom entries used
+        # to be unreachable with the mouse.  The scroller caps the height and
+        # takes over from there.
+        row_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        overlay_box = Gtk.ScrolledWindow()
+        overlay_box.set_child(row_box)
+        overlay_box.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        # Natural height, so a short list is still a short popup and only a
+        # long one starts scrolling.
+        overlay_box.set_propagate_natural_height(True)
+        overlay_box.set_max_content_height(self._tab_list_max_height())
+        # The bar takes layout space instead of floating over the last column of
+        # the titles, and it is styled as part of the popup (see the CSS) rather
+        # than left as a second system scrollbar next to the terminal's own.
+        overlay_box.set_overlay_scrolling(False)
         overlay_box.add_css_class("tab-list-overlay")
         overlay_box.set_halign(Gtk.Align.END)
         overlay_box.set_valign(Gtk.Align.START)
         overlay_box.set_margin_end(20)
         overlay_box.set_margin_top(4)
+        overlay_box.set_margin_bottom(4)
 
         self._tab_list_buttons = []
         # During MRU/sequential switching, mark the origin tab as "active"
@@ -1491,7 +1571,7 @@ class TerminalApp(Gtk.Application):
             if i == self._tab_list_selected:
                 btn.add_css_class("tab-list-item-selected")
             btn.connect("clicked", self._on_tab_list_item_clicked, i)
-            overlay_box.append(btn)
+            row_box.append(btn)
             self._tab_list_buttons.append(btn)
 
         # Add overlay to the current tab's overlay container
@@ -1500,9 +1580,153 @@ class TerminalApp(Gtk.Application):
             tab._overlay.add_overlay(overlay_box)
             self._tab_list_overlay_widget = overlay_box
             self._tab_list_overlay_parent = tab._overlay
+            # A pending scroll is retried from here as well as from the idle
+            # callback.  "changed" fires when the adjustment gets its lower/upper/
+            # page-size, which happens during allocation — that is the first
+            # moment the row offsets mean anything, and it can land after the
+            # idle has already run and given up.
+            _vadj = overlay_box.get_vadjustment()
+            if _vadj is not None:
+                _vadj.connect("changed", self._on_tab_list_adj_changed)
+            # Open scrolled to the selected tab — with many tabs the current one
+            # is usually well below the fold, and a list that opens at the top
+            # hides the very row the user came to look at.
+            self._queue_tab_list_scroll()
+
+    def _tab_list_max_height(self):
+        """Height cap for the tab list, derived from the window.
+
+        A fixed number would either waste space on a tall window or overflow a
+        short one.  The margins are the overlay's own (top/bottom) plus room for
+        the tab bar it hangs under.
+        """
+        try:
+            win_h = self._win.get_height()
+        except Exception:
+            win_h = 0
+        if win_h <= 0:
+            return 480
+        return max(120, win_h - 80)
+
+    def _queue_tab_list_scroll(self):
+        """Bring the selected row into view once the overlay has been laid out.
+
+        Deferred: right after the overlay is built — or re-parented onto another
+        tab for preview — the scroller has no allocation yet, so its adjustment
+        reports a page size of 0 and any offset computed now would be
+        meaningless.  Coalesced to one pending callback, because holding
+        Ctrl+Tab down would otherwise queue one per keypress.
+
+        The request stays pending until it actually succeeds.  An idle callback
+        is not a promise that layout has happened — all pending idles run before
+        the frame that allocates the scroller, so the first attempt on a freshly
+        built overlay usually finds a page size of 0.  That is why the list only
+        *sometimes* opened on the active tab: whether it worked came down to
+        whether an unrelated frame had already sized the widget.
+        """
+        self._tab_list_scroll_pending = True
+        self._tab_list_scroll_tries = 0
+        if self._tab_list_scroll_id:
+            return
+        self._tab_list_scroll_id = GLib.idle_add(self._tab_list_scroll_idle)
+
+    def _tab_list_scroll_idle(self):
+        self._tab_list_scroll_id = 0
+        self._try_tab_list_scroll()
+        return GLib.SOURCE_REMOVE
+
+    def _on_tab_list_adj_changed(self, _adj):
+        """Geometry arrived — finish the pending scroll, but from an idle.
+
+        Not done inline.  "changed" is emitted from inside the ScrolledWindow's
+        own size-allocate, and a value written there does not survive: the rest
+        of that allocation re-clamps the adjustment and the scroll is silently
+        undone.  An idle added here runs after the frame completes — the frame
+        clock outranks default idles, so it cannot cut in mid-layout — and the
+        write sticks.
+        """
+        if not self._tab_list_scroll_pending or self._tab_list_scroll_id:
+            return
+        self._tab_list_scroll_id = GLib.idle_add(self._tab_list_scroll_idle)
+
+    def _try_tab_list_scroll(self):
+        """Scroll to the selection, clearing the request only on success.
+
+        Two things about layout timing bite here, and both had to be handled:
+
+        The offset is derived from the adjustment and the row count rather than
+        by measuring the selected button.  Measuring looked simpler but cannot
+        work from "changed": that signal arrives in the middle of the layout pass
+        — the scroller already knows its own geometry while the rows inside it
+        have not been placed — so compute_bounds() returns a stale rectangle.
+        Every row here is a one-line Gtk.Button with identical padding, so
+        upper/count is the row height exactly and no child allocation is needed.
+
+        And this must never run *from* "changed", only from the idle it queues:
+        a value written during the ScrolledWindow's size-allocate is re-clamped
+        by the remainder of that same allocation, so the scroll would be computed
+        correctly and then quietly thrown away.
+        """
+        scroller = getattr(self, '_tab_list_overlay_widget', None)
+        buttons = getattr(self, '_tab_list_buttons', [])
+        idx = self._tab_list_selected
+        if scroller is None or not (0 <= idx < len(buttons)):
+            self._tab_list_scroll_pending = False
+            return
+        adj = scroller.get_vadjustment()
+        if adj is None:
+            self._tab_list_scroll_pending = False
+            return
+        page = adj.get_page_size()
+        upper = adj.get_upper()
+        if page <= 0 or upper <= 0:
+            return              # not laid out yet — stay pending and retry
+        if upper <= page:
+            self._tab_list_scroll_pending = False   # whole list fits
+            return
+
+        row_h = upper / len(buttons)
+        top = idx * row_h
+        bottom = top + row_h
+        value = adj.get_value()
+        # Keep a sliver of the neighbouring row visible: that edge is what shows
+        # there is more list past the selection.
+        margin = min(6.0, row_h / 2)
+        target = value
+        if top - margin < value:
+            target = max(0.0, top - margin)
+        elif bottom + margin > value + page:
+            target = min(upper - page, bottom + margin - page)
+
+        if target != value:
+            adj.set_value(target)
+            # Read it back rather than assuming.  The whole reason this was hard
+            # is that a write can be silently discarded, and clearing the request
+            # on an assumption is what left the selection off-screen.
+            if abs(adj.get_value() - target) > 0.5:
+                # Geometry is already good here, so "changed" may never fire
+                # again to trigger a retry — re-arm one ourselves.  Bounded,
+                # because the target is clamped into range before the write and
+                # therefore reachable: if it keeps failing, something is wrong
+                # that spinning will not fix, and an off-screen row beats a
+                # busy loop.
+                self._tab_list_scroll_tries += 1
+                if (self._tab_list_scroll_tries < 8
+                        and not self._tab_list_scroll_id):
+                    self._tab_list_scroll_id = GLib.idle_add(
+                        self._tab_list_scroll_idle)
+                else:
+                    self._tab_list_scroll_pending = False
+                return
+        self._tab_list_scroll_pending = False
 
     def _hide_tab_list_overlay(self):
         """Remove tab list overlay widget."""
+        if self._tab_list_scroll_id:
+            GLib.source_remove(self._tab_list_scroll_id)
+            self._tab_list_scroll_id = 0
+        self._tab_list_scroll_pending = False
+        self._tab_list_scroll_tries = 0
         widget = getattr(self, '_tab_list_overlay_widget', None)
         parent = getattr(self, '_tab_list_overlay_parent', None)
         if widget and parent:
@@ -1548,6 +1772,9 @@ class TerminalApp(Gtk.Application):
                 btn.add_css_class("tab-list-item-selected")
             else:
                 btn.remove_css_class("tab-list-item-selected")
+        # Follow the selection with the scroll, or Ctrl+Tab past the visible
+        # rows would move the highlight somewhere the user cannot see.
+        self._queue_tab_list_scroll()
         # Preview: switch to selected tab and move overlay to new tab
         if config.TAB_LIST_PREVIEW:
             idx = self._tab_list_selected
