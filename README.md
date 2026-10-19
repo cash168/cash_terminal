@@ -56,14 +56,32 @@ settings dialog, and desktop integration.
 - **Tab shortcuts**:
   - `Ctrl+T` — new tab (inherits cwd from current tab)
   - `Ctrl+W` — close current tab (last tab quits app)
-  - `Ctrl+Tab` — MRU (most recently used) switch
-  - `Ctrl+Left` / `Ctrl+Right` — sequential tab navigation
+  - `Ctrl+Tab` / `Ctrl+Shift+Tab` — MRU (most recently used) switch, forwards
+    and backwards
+  - `Ctrl+Left` / `Ctrl+Right` — sequential tab navigation (never shows the
+    switcher)
+- **Ctrl+Tab switcher** — hold `Ctrl` after `Ctrl+Tab` and, after a short delay
+  (200 ms by default, so a quick tap just flips to the last tab), a list of the
+  open tabs appears in the order Ctrl+Tab walks them — most recent first — with
+  each tab's position in the tab bar and its directory. The tab under the
+  highlight is switched to for real as you move. While `Ctrl` is held:
+  `Tab` / `Shift+Tab` or the arrows move, a click selects, `Del` or the row's ×
+  closes a tab, `Ctrl+T` opens one, `Esc` returns to where you started.
+  Releasing `Ctrl` closes the list and keeps the selected tab.
 - **Drag-to-reorder** — drag tabs with the mouse to rearrange them; MRU history
   and close-button behavior are preserved.
 - **Opera-like close** — both `Ctrl+W` and clicking × switch to the adjacent
   tab so the × stays under the cursor for rapid sequential closes.
-- **Tab list overlay** — `Ctrl+Up` / `Ctrl+Down` or the ▼ button opens a popup
-  list with live preview, keyboard navigation, and click support.
+- **Tab list** — `Ctrl+Up` / `Ctrl+Down` or the ▼ button drops a list of the
+  tabs in tab-bar order under the tab bar: the active tab marked ✓, each tab's
+  directory, a × on every row. Live preview, keyboard navigation, click to pick.
+- **Close confirmation** — closing the window with several tabs open asks
+  first, in a card over the dimmed window (`Enter` closes, `Esc` or a click
+  outside cancels), and names the tabs that are still running something.
+- **One look for everything the terminal draws itself** — the Ctrl+Tab
+  switcher, the tab list, the close confirmation and the Settings window share
+  one style: a caps header, a darker footer with key hints, rows with an inset
+  selection, and the terminal's own dark-blue scrollbar.
 - **Smart tab titles** — format `dir : process`; SSH tabs show `(user) host`.
 
 ### Search
@@ -97,8 +115,14 @@ settings dialog, and desktop integration.
 
 ### Settings Dialog
 
-- **Live-preview appearance editor** — opened from the context menu; changes
-  apply immediately to every open tab.
+- **Live-preview appearance editor** — opened from the context menu or the ⚙
+  button in the tab bar; changes apply immediately to every open tab.
+- **Same look as the terminal's own popups** — its own title bar (drag it to
+  move the window; its × cancels), caps section headers, dark inputs and
+  switches, and a footer with the buttons.
+- **Startup, behaviour, tab list and Ctrl+Tab switcher** — besides appearance:
+  start directory and window size, scrollback, what a new tab does, the tab
+  list's preview, and whether / after what delay Ctrl+Tab shows the switcher.
 - **Color editing** — primary foreground/background, cursor, and all 16 ANSI
   palette entries via `Gtk.ColorDialogButton`.
 - **Presets** — Konsole Linux Colors, Solarized Dark/Light, Dracula, Gruvbox,
@@ -173,7 +197,7 @@ from the bundled default (`cash_terminal/resources/linux.yaml`):
 | `scrollback_lines` | max scrollback buffer size |
 | `background_opacity` | `0.0`–`1.0` (also accepted under `colors.primary`) |
 | `startup` | `directory`, `maximized`, `window_size` |
-| `tab_list` | `preview`, `activate_on_select`, `show_on_ctrl_tab`, `show_on_ctrl_tab_delay` |
+| `tab_list` | tab list: `preview`, `activate_on_select`; Ctrl+Tab switcher: `show_on_ctrl_tab`, `show_on_ctrl_tab_delay` (ms, default 200) |
 | `env` | environment variables for the child shell (`TERM`, `COLORTERM`, …) |
 | `inputrc` | readline overrides (`enable-active-region`, …); set to `false` to disable |
 | `debug` | `true`/`false` — verbose logging |
@@ -221,25 +245,40 @@ cash-terminal [OPTIONS]
   --directory, -d DIR  Start in this directory
 ```
 
+## Supported Systems
+
+Building is supported on **Ubuntu 24.04** and on distributions based on it
+(Linux Mint 22, Pop!_OS 24.04, …) — that release only. Older releases lack what
+the front-end needs (GTK 4.12+; Ubuntu 22.04 ships 4.6), and newer ones are not
+supported yet. On anything else `build.sh` stops with an explanation before
+touching the system.
+
 ## Dependencies
 
-| Package | Ubuntu/Debian install |
-|---------|----------------------|
-| Python 3 | `sudo apt install python3` |
-| PyGObject (+ Cairo) | `sudo apt install python3-gi python3-gi-cairo` |
-| GTK4 GI bindings | `sudo apt install gir1.2-gtk-4.0` |
-| Pango / Cairo (GI) | included with the GTK4 / PyGObject packages above |
-| Rust toolchain | `rustup` from <https://rustup.rs> (provides `cargo`) |
-| maturin, PyYAML | installed automatically into the build venv by `build.sh` |
+`build.sh` checks all of these itself and offers to install what is missing
+(see below) — on a fresh install there is nothing to prepare by hand.
 
-`cashterm_core` is a compiled pyo3 extension; building it requires the Rust
-toolchain (`cargo`). There is **no** VTE dependency.
+| Needed for | Provided by |
+|------------|-------------|
+| Python 3 + `venv` | `python3`, `python3-venv` |
+| PyGObject, GTK 4, Cairo | `python3-gi`, `gir1.2-gtk-4.0`, `python3-gi-cairo` |
+| SVG icon loading | `librsvg2-common` |
+| Linker for the Rust core | `build-essential` |
+| Rust **1.88+** | `rustup` (<https://rustup.rs>), installed into `~/.cargo` |
+| Downloading rustup | `curl`, `ca-certificates` (only if Rust is being installed) |
+| maturin, PyYAML | installed into the build venv by `build.sh` (from PyPI) |
+
+Rust comes from rustup, not apt: Ubuntu 24.04's `cargo` is 1.75, and the locked
+dependency tree needs 1.88 (`home 0.5.12`, a dependency of `alacritty_terminal`).
+An older toolchain already on the system is detected and updated through rustup.
+
+`cashterm_core` is a compiled pyo3 extension; there is **no** VTE dependency.
 
 ## Build & Install
 
 ```bash
-# Build the Rust core + Python front-end and install to
-# /usr/local/sbin/cash-terminal
+# Check / install dependencies, build the Rust core + Python front-end, and
+# install the launcher to /usr/local/sbin/cash-terminal
 ./build.sh
 
 # Run
@@ -249,25 +288,48 @@ cash-terminal
 ./build.sh remove
 ```
 
-`build.sh` is self-contained and does everything itself:
+Run it as your normal user — it calls `sudo` itself where needed, and refuses to
+run as root (the app lives in your home directory). It needs internet access the
+first time (apt, rustup, PyPI).
 
-1. **Checks dependencies** — `python3`, PyGObject, GTK4, and `cargo` (it sources
-   `~/.cargo/env` / adds `~/.cargo/bin` to PATH if needed).
-2. **Creates an isolated venv** at
+`build.sh` does everything itself:
+
+1. **Checks the system** — Ubuntu 24.04 or a distribution based on it, read
+   from `UBUNTU_CODENAME=noble` in `/etc/os-release` (which every derivative
+   sets to its Ubuntu base).
+2. **Checks dependencies** by testing what the build actually uses — an import,
+   a command, the Rust version — so something installed another way is not
+   reinstalled. If anything is missing it lists it and asks:
+
+   ```
+   [!] Missing packages: python3-venv build-essential
+   [!] Rust 1.88+ is needed: rustup (https://rustup.rs) will install it into ~/.cargo.
+   Install the missing dependencies now? [y/N]
+   ```
+
+   `y` installs the packages with `sudo apt-get` and Rust with rustup, then
+   checks everything again. Any other answer installs nothing and prints the
+   exact commands to run yourself. Without a terminal to ask on (a pipe, CI) the
+   answer is always no — nothing is ever installed unasked.
+3. **Creates an isolated venv** at
    `~/.local/share/cash-terminal/venv` with `--system-site-packages` (so it
    sees the distro's PyGObject/Cairo), and installs `maturin` + `pyyaml` into
    it.
-3. **Builds the Rust core** — `maturin develop --release` compiles
+4. **Builds the Rust core** — `maturin develop --release` compiles
    `cashterm_core/` and installs the native extension into the venv (run inside
    a scoped subshell so the parent shell keeps no venv activated).
-4. **Packages the Python front-end** into a self-contained
+5. **Packages the Python front-end** into a self-contained
    [zipapp](https://docs.python.org/3/library/zipapp.html) (`.pyz`) at
-   `~/.local/share/cash-terminal/cash-terminal.pyz`. The bundled icon and
-   default config live in `cash_terminal/resources/` and load at runtime via
-   `importlib.resources`.
-5. **Installs a launcher** at `/usr/local/sbin/cash-terminal` — a tiny shim that
+   `~/.local/share/cash-terminal/cash-terminal.pyz`, installed by an atomic
+   rename so a running terminal is never left reading a half-written file. The
+   bundled icon and default config live in `cash_terminal/resources/` and load
+   at runtime via `importlib.resources`.
+6. **Installs a launcher** at `/usr/local/sbin/cash-terminal` — a tiny shim that
    runs the zipapp under the venv's Python (which holds the compiled
    `cashterm_core`; a native `.so` can't live inside a zipapp).
+
+Python-only changes still need `./build.sh`: the front-end runs from the zipapp,
+not from the source tree.
 
 Uninstall (`./build.sh remove`) removes the launcher, the runtime data
 directory (venv + zipapp), and the installed icons / `.desktop` file.
@@ -286,6 +348,7 @@ directory (venv + zipapp), and the installed icons / `.desktop` file.
 | `cash_terminal/session_picker.py` | `SessionPicker` — searchable list of what a tab can run (local shell, favourites, recent SSH); used for `new_tab.action: picker` and Ctrl+E |
 | `cash_terminal/connections.py` | Favourites + SSH history store, kept in `~/.cash-terminal/connections.yaml` (rewritten by the app, separate from `linux.yaml`) |
 | `cash_terminal/connections_dialog.py` | `ConnectionsDialog` — editor for those favourites; promotes history entries into them |
+| `cash_terminal/popups.py` | In-window popups in one style: `TabSwitcher` (Ctrl+Tab, most recent first), `TabListPopup` (▼ tab list), `ConfirmPopup` (close confirmation) |
 | `cash_terminal/settings.py` | `SettingsDialog` — live-preview editor (colors/presets/font/opacity, startup, behaviour, tab list, env) |
 | `cash_terminal/presets.py` | Built-in color-scheme presets + current-scheme matching |
 | `cash_terminal/config.py` | Constants + `linux.yaml` loader/saver |
@@ -298,7 +361,7 @@ directory (venv + zipapp), and the installed icons / `.desktop` file.
 | `cashterm_core/Cargo.toml` | Rust crate manifest (pyo3 0.22, alacritty_terminal 0.24) |
 | `cashterm_core/Cargo.lock` | Pinned Rust dependency versions — committed so a build is reproducible |
 | `cashterm_core/pyproject.toml` | maturin build config (builds the crate as the `cashterm_core` extension module) |
-| `build.sh` | Build/install script — venv + maturin core build + zipapp + launcher |
+| `build.sh` | Build/install script — system and dependency check (offers to install what is missing), venv + maturin core build + zipapp + launcher |
 | `check_deps.py` | Optional diagnostic — reports which dependencies are present and what to install (not required for build) |
 | `LICENSE` | Apache License 2.0 |
 

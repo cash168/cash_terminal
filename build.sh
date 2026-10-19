@@ -73,38 +73,187 @@ if [[ "${1:-}" == "remove" ]]; then
     exit 0
 fi
 
+# ---- Supported system ----
+# Building is supported on Ubuntu 24.04 and on distributions based on it
+# (Linux Mint 22, Pop!_OS 24.04, …) — that release only.  Older ones lack what
+# the front-end needs (GTK 4.12+; 22.04 ships 4.6); newer ones are simply not
+# supported yet (26.04 would also need a newer pyo3 for its Python).
+UBUNTU_SUPPORTED_CODENAME="noble"
+UBUNTU_SUPPORTED="24.04"
+
+if [[ ${EUID} -eq 0 ]]; then
+    error "Run ./build.sh as your normal user, not as root: it calls sudo itself where needed, and the app is installed into your home directory (${DATA_DIR})."
+fi
+
+# Read os-release in a subshell so its variables (ID, NAME, VERSION, …) do not
+# leak into this script.  "|| true": under set -e a failing $(...) in an
+# assignment would end the script silently, without the error below.
+os_field() { ( . /etc/os-release 2>/dev/null && eval "printf '%s' \"\${$1:-}\"" ) || true; }
+OS_NAME="$(os_field PRETTY_NAME)"
+# One check covers Ubuntu itself and every derivative: all of them name their
+# Ubuntu base in UBUNTU_CODENAME (a derivative's own VERSION_ID is its own
+# numbering — Mint 22.1 — and says nothing about the base).  A system that is
+# not Ubuntu-based has no such field and fails the same test.
+if [[ "$(os_field UBUNTU_CODENAME)" != "${UBUNTU_SUPPORTED_CODENAME}" ]]; then
+    error "Unsupported system: ${OS_NAME:-unknown}. Building is supported on Ubuntu ${UBUNTU_SUPPORTED} (${UBUNTU_SUPPORTED_CODENAME}) and distributions based on it only."
+fi
+
+command -v sudo >/dev/null 2>&1 || error "sudo not found. As root: apt-get install sudo"
+
 # ---- Check dependencies ----
-info "Checking dependencies..."
+# Everything a fresh install lacks is collected first, then installed in one
+# go — but only after asking.  Checks test what the build and the app actually
+# use (an import, a command), so a dependency satisfied some other way is not
+# reinstalled; each failed check names the apt package that provides it.
+#
+# Rust is the exception to apt: Ubuntu 24.04's cargo is 1.75, and the locked
+# dependency tree needs RUST_MIN — set by home 0.5.12, a Linux dependency of
+# alacritty_terminal 0.24.2, which declares rust-version = 1.88.  So it comes
+# from rustup.  After updating Cargo.lock, re-check: the highest rust-version
+# among the crates cargo compiles for Linux.
+RUST_MIN="1.88"
 
-command -v python3 >/dev/null 2>&1 || error "python3 not found. Install: sudo apt install python3"
+APT_MISSING=()
+RUST_ACTION=""          # "" | install (no rustup yet) | update (rustup, old toolchain)
+RUST_FOUND=""
 
-python3 -c "import gi" 2>/dev/null || error "PyGObject not found. Install: sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0"
+need_apt() {
+    local p
+    for p in "$@"; do
+        [[ " ${APT_MISSING[*]-} " == *" ${p} "* ]] || APT_MISSING+=("${p}")
+    done
+}
 
-python3 -c "
-import gi
-gi.require_version('Gtk', '4.0')
-from gi.repository import Gtk
-" 2>/dev/null || error "GTK4 GI bindings not found. Install: sudo apt install gir1.2-gtk-4.0"
+pkg_installed() {
+    # One status per installed architecture: a multi-arch package installed
+    # for amd64 and i386 alike (librsvg2-common, on any system with i386
+    # enabled) prints "installed" twice, so compare line by line, never the
+    # whole output.  Captured first rather than piped into grep -q: grep quits
+    # at the first match, dpkg-query gets SIGPIPE, and pipefail turns that
+    # into a false "not installed".
+    local status
+    status="$(dpkg-query -W -f='${db:Status-Status}\n' "$1" 2>/dev/null || true)"
+    grep -qx installed <<< "${status}"
+}
 
-# The terminal grid is rendered by the Rust core (cashterm_core), a compiled
-# pyo3 extension built here with maturin.  Building it needs a Rust toolchain.
 # rustup installs cargo into ~/.cargo/bin, which is often not on a plain
-# (non-login) bash PATH — pull it in so the build works out of the box.
-if ! command -v cargo >/dev/null 2>&1; then
+# (non-login) bash PATH — pull it in so an existing toolchain is found.
+load_cargo_env() {
     if [[ -f "${HOME}/.cargo/env" ]]; then
         # shellcheck disable=SC1091
         source "${HOME}/.cargo/env"
-    elif [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
+    elif [[ -d "${HOME}/.cargo/bin" && ":${PATH}:" != *":${HOME}/.cargo/bin:"* ]]; then
         export PATH="${HOME}/.cargo/bin:${PATH}"
     fi
+}
+
+check_deps() {
+    APT_MISSING=()
+    RUST_ACTION=""
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import venv, ensurepip' 2>/dev/null || need_apt python3-venv
+        python3 -c 'import gi; gi.require_version("Gtk", "4.0"); from gi.repository import Gtk' \
+            2>/dev/null || need_apt python3-gi gir1.2-gtk-4.0
+        python3 -c 'import gi, cairo; gi.require_foreign("cairo")' 2>/dev/null \
+            || need_apt python3-gi-cairo
+    else
+        need_apt python3 python3-venv python3-gi gir1.2-gtk-4.0 python3-gi-cairo
+    fi
+    # The app renders its own icon from SVG through GdkPixbuf.
+    pkg_installed librsvg2-common || need_apt librsvg2-common
+    # Rust links the extension with the system C toolchain.
+    command -v cc >/dev/null 2>&1 || need_apt build-essential
+
+    load_cargo_env
+    RUST_FOUND="$(rustc --version 2>/dev/null | awk '{print $2}' || true)"
+    if [[ -z "${RUST_FOUND}" ]] || ! dpkg --compare-versions "${RUST_FOUND}" ge "${RUST_MIN}"; then
+        if command -v rustup >/dev/null 2>&1; then
+            RUST_ACTION="update"
+        else
+            RUST_ACTION="install"
+            command -v curl >/dev/null 2>&1 || need_apt curl
+            pkg_installed ca-certificates || need_apt ca-certificates
+        fi
+    fi
+}
+
+deps_missing() { (( ${#APT_MISSING[@]} )) || [[ -n "${RUST_ACTION}" ]]; }
+
+describe_missing() {
+    if (( ${#APT_MISSING[@]} )); then
+        warn "Missing packages: ${APT_MISSING[*]}"
+    fi
+    case "${RUST_ACTION}" in
+        install) warn "Rust ${RUST_MIN}+ is needed${RUST_FOUND:+ (found ${RUST_FOUND})}: rustup (https://rustup.rs) will install it into ~/.cargo." ;;
+        update)  warn "Rust ${RUST_MIN}+ is needed${RUST_FOUND:+ (found ${RUST_FOUND})}: rustup will update the stable toolchain." ;;
+    esac
+    return 0
+}
+
+print_manual() {
+    echo "Install them yourself, then run ./build.sh again:"
+    if (( ${#APT_MISSING[@]} )); then
+        echo "  sudo apt-get update && sudo apt-get install -y ${APT_MISSING[*]}"
+    fi
+    case "${RUST_ACTION}" in
+        install) echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal" ;;
+        update)  echo "  rustup update stable && rustup default stable" ;;
+    esac
+    return 0
+}
+
+# Asks on the terminal; with no terminal to ask on (a pipe, CI) the answer is
+# no — nothing is ever installed unasked.  "н" is accepted too: it is the y key
+# on a Russian keyboard layout.
+ask_yes() {
+    local reply=""
+    [[ -t 0 ]] || return 1
+    read -r -p "$1 [y/N] " reply || return 1
+    case "${reply}" in
+        y|Y|yes|Yes|YES|н|Н) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+info "Checking dependencies (${OS_NAME})..."
+check_deps
+if deps_missing; then
+    describe_missing
+    if ! ask_yes "Install the missing dependencies now?"; then
+        print_manual
+        error "Missing dependencies — nothing was installed."
+    fi
+    if (( ${#APT_MISSING[@]} )); then
+        info "Installing ${APT_MISSING[*]} ..."
+        sudo apt-get update || error "apt-get update failed."
+        sudo apt-get install -y "${APT_MISSING[@]}" || error "apt-get install failed."
+    fi
+    case "${RUST_ACTION}" in
+        install)
+            info "Installing Rust with rustup ..."
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal || error "rustup installation failed."
+            ;;
+        update)
+            info "Updating the Rust toolchain with rustup ..."
+            { rustup update stable && rustup default stable; } || error "rustup update failed."
+            ;;
+    esac
+    # Check again rather than trust the installers' exit codes: what matters
+    # is that every check passes now.
+    check_deps
+    if deps_missing; then
+        describe_missing
+        error "Dependencies are still missing after the installation."
+    fi
 fi
-command -v cargo >/dev/null 2>&1 || error "cargo (Rust toolchain) not found. Install: https://rustup.rs"
 
 [[ -d "${PKG_DIR}"  ]] || error "Package directory not found: ${PKG_DIR}"
 [[ -d "${CORE_DIR}" ]] || error "Rust core directory not found: ${CORE_DIR}"
 [[ -f "${CORE_DIR}/Cargo.toml" ]] || error "Cargo.toml not found in ${CORE_DIR}"
 
-info "All dependencies OK."
+info "All dependencies OK (Rust ${RUST_FOUND})."
 
 # ---- Create the isolated runtime venv ----
 # --system-site-packages so the venv sees the distro's PyGObject / cairo,

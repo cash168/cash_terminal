@@ -116,6 +116,9 @@ class SettingsDialog(Gtk.Window):
         self.set_transient_for(parent)
         self.set_modal(True)
         self.set_default_size(460, 640)
+        # Same look as the terminal's own popups (ct-* classes, app.py CSS).
+        self.add_css_class("ct-settings")
+        self.set_titlebar(self._build_titlebar())
 
         # apply_cb() re-applies the current config globals to all open tabs.
         self._apply_cb = apply_cb
@@ -161,27 +164,34 @@ class SettingsDialog(Gtk.Window):
         self._build_tab_list_section(content)
         self._build_env_section(content)
 
-        # Separator between scrolled content and the action buttons.
-        root.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
-
-        # Action buttons
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        btn_box.set_halign(Gtk.Align.END)
-        btn_box.set_margin_top(14)
-        btn_box.set_margin_bottom(16)
-        btn_box.set_margin_start(20)
-        btn_box.set_margin_end(20)
+        # Footer in the popups' style: key hints on the left, buttons right.
+        # The divider above it is the footer's own top border.
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        footer.add_css_class("ct-settings-footer")
+        esc = Gtk.Label(label="Esc")
+        esc.add_css_class("ct-key")
+        esc.set_valign(Gtk.Align.CENTER)
+        footer.append(esc)
+        esc_hint = Gtk.Label(label="отмена")
+        esc_hint.add_css_class("ct-hint")
+        esc_hint.set_valign(Gtk.Align.CENTER)
+        footer.append(esc_hint)
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        footer.append(spacer)
 
         cancel_btn = Gtk.Button(label="Отмена")
+        cancel_btn.add_css_class("ct-button")
         cancel_btn.connect("clicked", self._on_cancel)
-        btn_box.append(cancel_btn)
+        footer.append(cancel_btn)
 
         save_btn = Gtk.Button(label="Сохранить")
-        save_btn.add_css_class("suggested-action")
+        save_btn.add_css_class("ct-button")
+        save_btn.add_css_class("accent")
         save_btn.connect("clicked", self._on_save)
-        btn_box.append(save_btn)
+        footer.append(save_btn)
 
-        root.append(btn_box)
+        root.append(footer)
 
         # Esc cancels (restore + close).
         key = Gtk.EventControllerKey()
@@ -245,12 +255,40 @@ class SettingsDialog(Gtk.Window):
             snap["TAB_LIST_SHOW_ON_CTRL_TAB_DELAY"]
 
     # --------------------------------------------------------- builders
+    def _build_titlebar(self):
+        """Our own title bar, in the popups' header style.
+
+        A Gtk.WindowHandle, so the window still drags by it.  Its × is Cancel
+        — the same as Escape and as the window manager's close — because a
+        window that closes without restoring the live preview would leave half-
+        applied colours behind.
+        """
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        bar.add_css_class("ct-settings-titlebar")
+        title = Gtk.Label(label="НАСТРОЙКИ ТЕРМИНАЛА", xalign=0.0)
+        title.set_hexpand(True)
+        title.set_valign(Gtk.Align.CENTER)
+        title.add_css_class("ct-popup-title")
+        bar.append(title)
+        close = Gtk.Button(label="×")
+        close.set_has_frame(False)
+        close.set_focusable(False)
+        close.set_valign(Gtk.Align.CENTER)
+        close.add_css_class("ct-row-close")
+        close.set_tooltip_text("Отмена (Esc)")
+        close.connect("clicked", self._on_cancel)
+        bar.append(close)
+        handle = Gtk.WindowHandle()
+        handle.set_child(bar)
+        return handle
+
     @staticmethod
     def _section_label(text):
-        lbl = Gtk.Label(label=text)
+        # Caps written out rather than via CSS text-transform, which not every
+        # GTK 4 release honours.
+        lbl = Gtk.Label(label=text.upper())
         lbl.set_xalign(0.0)
-        lbl.add_css_class("heading")
-        lbl.set_markup(f"<b>{text}</b>")
+        lbl.add_css_class("ct-section")
         return lbl
 
     def _make_color_button(self, name, hex_value):
@@ -631,20 +669,30 @@ class SettingsDialog(Gtk.Window):
             grid, 1, "Переключаться сразу при выборе",
             config.TAB_LIST_ACTIVATE_ON_SELECT, self._on_tl_activate)
 
+        parent.append(grid)
+
+        # Ctrl+Tab has a switcher of its own (tab_switcher.py) and the list
+        # above no longer takes part in it, so its options get their own
+        # section.  The config keys keep their tab_list.* names on purpose: an
+        # existing linux.yaml carries over without a migration.
+        parent.append(self._section_label("Переключатель Ctrl+Tab"))
+
+        ctrl_grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+
         self._tl_ctrl_tab_switch = self._switch_row(
-            grid, 2, "Открывать по Ctrl+Tab",
+            ctrl_grid, 0, "Показывать список, пока зажат Ctrl",
             config.TAB_LIST_SHOW_ON_CTRL_TAB, self._on_tl_ctrl_tab)
 
         self._tl_delay_entry = self._int_row(
-            grid, 3, "Задержка перед показом, мс",
+            ctrl_grid, 1, "Задержка перед показом, мс",
             int(config.TAB_LIST_SHOW_ON_CTRL_TAB_DELAY), self._on_tl_delay,
             width=6)
 
-        parent.append(grid)
+        parent.append(ctrl_grid)
 
         hint = Gtk.Label(
             label="Задержка нужна, чтобы быстрое Ctrl+Tab просто переключало "
-                  "вкладку, не открывая список; 0 — показывать сразу.")
+                  "на прошлую вкладку, не открывая список; 0 — показывать сразу.")
         hint.set_xalign(0.0)
         hint.set_wrap(True)
         hint.add_css_class("dim-label")
@@ -653,7 +701,7 @@ class SettingsDialog(Gtk.Window):
         self._sync_tab_list_sensitivity()
 
     def _sync_tab_list_sensitivity(self):
-        """The delay only means anything while Ctrl+Tab opens the list."""
+        """The delay only means anything while Ctrl+Tab shows the switcher."""
         self._tl_delay_entry.set_sensitive(config.TAB_LIST_SHOW_ON_CTRL_TAB)
 
     def _on_tl_preview(self, switch, _pspec):

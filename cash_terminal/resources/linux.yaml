@@ -61,12 +61,14 @@ scrollback_lines: 1000000
 # Background opacity: 0.0 = fully transparent, 1.0 = fully opaque
 background_opacity: 0.85
 
-# Tab list overlay (Ctrl+Up/Down or ▼ button).  Also editable in the settings
-# dialog (⚙ in the tab bar) → «Список вкладок».
-#   preview: true             — show highlighted tab while navigating the list
-#   activate_on_select: true  — activate tab on Ctrl release (false = require Enter)
-#   show_on_ctrl_tab: true    — show tab list overlay during Ctrl+Tab switching
-#   show_on_ctrl_tab_delay: 200 — delay (ms) before overlay appears; quick switch won't show it
+# Tab list overlay (Ctrl+Up/Down or ▼ button) and the Ctrl+Tab switcher.  Also
+# editable in the settings dialog (⚙ in the tab bar).
+#   preview: true             — tab list: show highlighted tab while navigating
+#   activate_on_select: true  — tab list: activate on Ctrl release (false = Enter)
+#   show_on_ctrl_tab: true    — Ctrl+Tab: show the switcher (open tabs, most
+#                               recent first) while Ctrl is held
+#   show_on_ctrl_tab_delay: 200 — Ctrl+Tab: delay (ms) before the switcher
+#                               appears; a quick tap just flips to the last tab
 tab_list:
   preview: true
   activate_on_select: true

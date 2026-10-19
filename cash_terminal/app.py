@@ -19,6 +19,7 @@ from .tab import TerminalTab
 # so a rebuild can no longer break a live session.
 from .settings import SettingsDialog
 from .connections_dialog import ConnectionsDialog
+from .popups import TabSwitcher, TabListPopup, ConfirmPopup
 
 
 # Reverse-DNS application identifier.  One constant because the same string has
@@ -93,17 +94,21 @@ class TerminalApp(Gtk.Application):
         # Remembered tab title
         self._remembered_tab_title = None
         self._remembered_win_title = None
-        # Tab list overlay widgets
-        self._tab_list_overlay_widget = None
-        self._tab_list_overlay_parent = None
-        self._tab_list_buttons = []
-        # Pending id of the deferred scroll-to-selection, 0 when none, plus the
-        # request itself — it outlives a failed attempt (see _queue_tab_list_scroll).
-        self._tab_list_scroll_id = 0
-        self._tab_list_scroll_pending = False
-        self._tab_list_scroll_tries = 0
-        # Close-confirmation via bottom bar (not dialog)
-        self._close_confirm_pending = False
+        # The tab list popup (popups.TabListPopup) while it is open.
+        self._tab_list_popup = None
+        # The close-window question (popups.ConfirmPopup) while it is open.
+        self._close_confirm = None
+        # Ctrl+Tab session.  _switch_order is the tab list in the order Ctrl+Tab
+        # walks it — fixed when the session starts, so the switcher rows do not
+        # reshuffle under the highlight — and _switch_index is the selected one.
+        # The session is separate from Ctrl+Left/Right, which also freezes the
+        # MRU history but never shows the switcher.
+        self._switch_session = False
+        self._switch_order = []
+        self._switch_index = 0
+        self._switch_origin = None   # the tab Ctrl+Tab started from (Escape returns)
+        self._switcher = None
+        self._win_overlay = None
 
     def do_startup(self):
         """Called once on first activation — install icons/desktop BEFORE window.
@@ -185,7 +190,19 @@ class TerminalApp(Gtk.Application):
         notebook.set_hexpand(True)
         notebook.connect("switch-page", self._on_switch_page)
         self._notebook = notebook
-        win.set_child(notebook)
+        # Window-level overlay, for the Ctrl+Tab switcher.  It belongs above all
+        # tabs at once: the tabs underneath change on every press, and a widget
+        # hung on one tab's own overlay has to be re-parented each time — which
+        # resets its scroll position and was the root of a run of bugs in the
+        # right-hand tab list.
+        self._win_overlay = Gtk.Overlay()
+        self._win_overlay.set_child(notebook)
+        win.set_child(self._win_overlay)
+        # The Ctrl release that ends a Ctrl+Tab session goes to whichever window
+        # has the focus.  Leave ours mid-session (Alt+Tab with Ctrl still down)
+        # and that release is never seen here: the session would stay open and
+        # the switcher stuck on screen.  Losing the focus ends it instead.
+        win.connect("notify::is-active", self._on_win_active_changed)
 
         # Left-side action widget: [◀] prev tab
         prev_btn = Gtk.Button(label="\u25C0")
@@ -357,34 +374,226 @@ class TerminalApp(Gtk.Application):
                 box-shadow: none;
             }}
 
-            .tab-list-overlay {{
-                background: rgba(46, 50, 56, 0.97);
-                border-radius: 4px;
+            /* Popups drawn by the terminal itself (popups.py) — the Ctrl+Tab
+               switcher, the tab list, the confirm card — and, through the same
+               classes, the settings window.  One visual language: a caps
+               header, 1px dividers, uniform rows with an inset rounded
+               selection, a darker footer with key caps.  Proportions were
+               measured from the reference design; the colours are this
+               terminal's own. */
+            .ct-popup {{
+                background: rgba(46, 50, 56, 0.98);
                 border: 1px solid rgba(100, 110, 120, 0.6);
-                padding: 4px 0;
-                min-width: 300px;
+                border-radius: 8px;
+                color: #e0e0e0;
             }}
 
-            /* Our own bar instead of the stock one.  The popup hangs just inside
-               the terminal's own scrollbar, so a default-looking scrollbar here
-               read as a second system scrollbar sitting next to the first.  The
-               trough, the steppers and the light background are all removed and
-               what is left is a dark blue strip that belongs to the popup.
-               AUTOMATIC policy still hides it completely when the list fits. */
-            .tab-list-overlay scrollbar {{
+            .ct-popup-header {{
+                padding: 7px 14px 6px 14px;
+                border-bottom: 1px solid rgba(100, 110, 120, 0.35);
+            }}
+
+            .ct-popup-title,
+            .ct-section {{
+                color: #c0c4c8;
+                font-size: 12px;
+                font-weight: bold;
+                letter-spacing: 1px;
+            }}
+
+            .ct-popup-footer {{
+                padding: 5px 12px;
+                border-top: 1px solid rgba(100, 110, 120, 0.35);
+                background: rgba(34, 37, 42, 0.98);
+                border-radius: 0 0 8px 8px;
+            }}
+
+            .ct-key {{
+                padding: 0 6px;
+                margin-right: 6px;
+                border: 1px solid #4a5058;
+                border-radius: 3px;
+                background: #1e2126;
+                color: #d0d0d0;
+                font-family: monospace;
+                font-size: 11px;
+            }}
+
+            .ct-hint {{
+                color: #b8bcc0;
+                font-size: 12px;
+                margin-right: 14px;
+            }}
+
+            .ct-hint.end {{
+                margin-right: 0;
+            }}
+
+            .ct-rows {{
+                padding: 4px 0;
+            }}
+
+            .ct-row {{
+                min-height: 32px;
+                margin: 0 4px;
+                padding: 0 6px 0 8px;
+                border-radius: 4px;
+                color: #e0e0e0;
+            }}
+
+            /* The tab list is a menu: the reference's rows are ~26px. */
+            .ct-row.compact {{
+                min-height: 26px;
+            }}
+
+            .ct-row:hover {{
+                background: rgba(255, 255, 255, 0.06);
+            }}
+
+            .ct-row.selected {{
+                background: rgba(60, 90, 130, 0.85);
+                color: #ffffff;
+            }}
+
+            .ct-row-num {{
+                min-width: 18px;
+                margin-right: 10px;
+                padding: 0 4px;
+                border-radius: 3px;
+                background: rgba(255, 255, 255, 0.08);
+                color: #9aa0a6;
+                font-size: 11px;
+            }}
+
+            .ct-row.selected .ct-row-num {{
+                background: rgba(255, 255, 255, 0.18);
+                color: #ffffff;
+            }}
+
+            .ct-row-check {{
+                min-width: 16px;
+                margin-right: 8px;
+                color: #6E9CBB;
+                font-size: 13px;
+            }}
+
+            .ct-row.selected .ct-row-check {{
+                color: #ffffff;
+            }}
+
+            .ct-row-name {{
+                font-size: 13px;
+                margin-right: 12px;
+            }}
+
+            .ct-row-detail {{
+                font-family: monospace;
+                font-size: 12px;
+                color: #8a9096;
+                margin-right: 8px;
+            }}
+
+            .ct-row-current {{
+                font-size: 12px;
+                color: #8a9096;
+                margin-right: 6px;
+            }}
+
+            .ct-row.selected .ct-row-detail,
+            .ct-row.selected .ct-row-current {{
+                color: #d6e2ef;
+            }}
+
+            .ct-row-close {{
+                min-width: 22px;
+                min-height: 22px;
+                padding: 0;
+                border: none;
+                border-radius: 4px;
+                background: none;
+                box-shadow: none;
+                color: #7a8088;
+            }}
+
+            .ct-row-close:hover {{
+                background: rgba(255, 255, 255, 0.12);
+                color: #ffffff;
+            }}
+
+            .ct-row.selected .ct-row-close {{
+                color: #d6e2ef;
+            }}
+
+            /* Confirm card: a dimmed window behind it, so it cannot be read as
+               one more line of terminal output. */
+            .ct-scrim {{
+                background: rgba(0, 0, 0, 0.45);
+            }}
+
+            .ct-card-body {{
+                padding: 14px 16px 12px 16px;
+            }}
+
+            .ct-card-text {{
+                font-size: 13px;
+                color: #e0e0e0;
+            }}
+
+            .ct-card-line {{
+                font-family: monospace;
+                font-size: 12px;
+                color: #c0c4c8;
+                margin-top: 4px;
+                margin-left: 8px;
+            }}
+
+            .ct-button {{
+                min-height: 24px;
+                padding: 2px 14px;
+                margin-left: 8px;
+                border: 1px solid rgba(100, 110, 120, 0.6);
+                border-radius: 4px;
+                background: rgba(255, 255, 255, 0.06);
+                color: #e0e0e0;
+                box-shadow: none;
+            }}
+
+            .ct-button:hover {{
+                background: rgba(255, 255, 255, 0.12);
+            }}
+
+            .ct-button.accent {{
+                background: #3C5A82;
+                border-color: #6E9CBB;
+                color: #ffffff;
+            }}
+
+            .ct-button.accent:hover {{
+                background: #46679A;
+            }}
+
+            /* Our own scrollbar instead of the stock one.  The popups hang just
+               inside the terminal's own scrollbar, so a default-looking one
+               read as a second system scrollbar next to the first.  What is
+               left is a dark blue strip that belongs to the popup; AUTOMATIC
+               policy still hides it when everything fits. */
+            .ct-popup scrollbar,
+            .ct-settings scrollbar {{
                 background: transparent;
                 border: none;
                 min-width: 10px;
             }}
 
-            .tab-list-overlay scrollbar trough {{
+            .ct-popup scrollbar trough,
+            .ct-settings scrollbar trough {{
                 background: rgba(255, 255, 255, 0.05);
                 border: none;
                 border-radius: 5px;
                 margin: 2px;
             }}
 
-            .tab-list-overlay scrollbar slider {{
+            .ct-popup scrollbar slider,
+            .ct-settings scrollbar slider {{
                 background: #2F4A6E;
                 border-radius: 5px;
                 min-height: 28px;
@@ -394,35 +603,132 @@ class TerminalApp(Gtk.Application):
                 background-clip: padding-box;
             }}
 
-            .tab-list-overlay scrollbar slider:hover {{
+            .ct-popup scrollbar slider:hover,
+            .ct-settings scrollbar slider:hover {{
                 background: #3C5A82;
             }}
 
-            .tab-list-overlay scrollbar slider:active {{
+            .ct-popup scrollbar slider:active,
+            .ct-settings scrollbar slider:active {{
                 background: #6E9CBB;
             }}
 
-            .tab-list-item {{
-                padding: 4px 14px;
-                min-height: 26px;
-                border-radius: 0;
-                color: #c0c0c0;
-                font-size: 13px;
-            }}
-
-            .tab-list-item:hover {{
-                background: rgba(255, 255, 255, 0.08);
-            }}
-
-            .tab-list-item-active {{
+            /* Settings window (settings.py), in the same style.  It is a real
+               window — it can be moved off the terminal — but its title bar is
+               our own, and every control in it is restyled away from the stock
+               light theme. */
+            window.ct-settings {{
+                background: #2E3238;
                 color: #e0e0e0;
-                border-left: 3px solid #6E9CBB;
-                padding-left: 11px;
             }}
 
-            .tab-list-item-selected {{
-                background: rgba(60, 90, 130, 0.7);
+            .ct-settings-titlebar {{
+                min-height: 32px;
+                padding: 0 6px 0 14px;
+                background: #22252A;
+                border-bottom: 1px solid rgba(100, 110, 120, 0.35);
+            }}
+
+            .ct-section {{
+                padding-bottom: 5px;
+                margin-top: 8px;
+                border-bottom: 1px solid rgba(100, 110, 120, 0.35);
+            }}
+
+            .ct-settings .dim-label {{
+                color: #8a9096;
+                opacity: 1;
+            }}
+
+            .ct-settings entry {{
+                min-height: 26px;
+                background: #1C1F24;
+                color: #e0e0e0;
+                border: 1px solid rgba(100, 110, 120, 0.5);
+                border-radius: 4px;
+                box-shadow: none;
+            }}
+
+            .ct-settings entry:focus-within {{
+                border-color: #6E9CBB;
+            }}
+
+            .ct-settings button {{
+                background: rgba(255, 255, 255, 0.06);
+                color: #e0e0e0;
+                border: 1px solid rgba(100, 110, 120, 0.6);
+                border-radius: 4px;
+                box-shadow: none;
+            }}
+
+            .ct-settings button:hover {{
+                background: rgba(255, 255, 255, 0.12);
+            }}
+
+            .ct-settings button.flat {{
+                background: none;
+                border-color: transparent;
+            }}
+
+            .ct-settings button.flat:hover {{
+                background: rgba(255, 255, 255, 0.12);
+            }}
+
+            .ct-settings switch {{
+                background: rgba(255, 255, 255, 0.12);
+                border: 1px solid rgba(100, 110, 120, 0.6);
+                border-radius: 12px;
+            }}
+
+            .ct-settings switch:checked {{
+                background: #3C5A82;
+                border-color: #6E9CBB;
+            }}
+
+            .ct-settings switch slider {{
+                background: #e0e0e0;
+                border: none;
+                box-shadow: none;
+            }}
+
+            .ct-settings scale trough {{
+                background: rgba(255, 255, 255, 0.12);
+                border: none;
+            }}
+
+            .ct-settings scale highlight {{
+                background: #3C5A82;
+            }}
+
+            .ct-settings scale slider {{
+                background: #e0e0e0;
+                border: 1px solid #6E9CBB;
+                box-shadow: none;
+            }}
+
+            .ct-settings popover > contents {{
+                background: #2E3238;
+                color: #e0e0e0;
+                border: 1px solid rgba(100, 110, 120, 0.6);
+            }}
+
+            .ct-settings popover list {{
+                background: transparent;
+            }}
+
+            .ct-settings popover row:hover {{
+                background: rgba(255, 255, 255, 0.06);
+            }}
+
+            .ct-settings popover row:selected {{
+                background: rgba(60, 90, 130, 0.85);
                 color: #ffffff;
+            }}
+
+            .ct-settings-footer {{
+                padding: 8px 14px;
+                background: #22252A;
+                border-top: 1px solid rgba(100, 110, 120, 0.35);
             }}
 
             vte-terminal {{
@@ -759,6 +1065,7 @@ class TerminalApp(Gtk.Application):
         self._remember_tab(tab)
         tab.grab_terminal_focus()
         self._update_nav_buttons_visibility()
+        return tab
 
     def _update_remembered_title(self, tab=None):
         """Snapshot tab title from the given (or current) tab.
@@ -929,19 +1236,12 @@ class TerminalApp(Gtk.Application):
         tab = self._get_visible_terminal()
 
         # --- Close-confirmation bar (app-level, highest priority) ---
-        if self._close_confirm_pending:
+        if self._close_confirm is not None:
             if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-                self._close_confirm_pending = False
-                if tab:
-                    tab._confirm_bar.set_visible(False)
-                self._do_close()
-                return True
-            if keyval == Gdk.KEY_Escape:
-                self._close_confirm_pending = False
-                if tab:
-                    tab._confirm_bar.set_visible(False)
-                return True
-            # Block all other keys while close-confirm is active
+                self._close_confirm.answer(True)
+            elif keyval == Gdk.KEY_Escape:
+                self._close_confirm.answer(False)
+            # Every other key waits until the question is answered.
             return True
 
         # --- Confirmation bar handling (per-tab, paste/command) ---
@@ -954,6 +1254,39 @@ class TerminalApp(Gtk.Application):
                 return True
             # Block all other keys while confirm is active
             return True
+
+        # --- Ctrl+Tab switcher session ---
+        # Live for as long as Ctrl stays down after Ctrl+Tab, whether or not the
+        # switcher has appeared yet (it waits out the delay).  Tab itself is left
+        # to the Ctrl+Tab block further down; these are the keys that only mean
+        # something inside a session.  Checked before the right-hand tab list,
+        # which a session closes when it starts.
+        if self._switch_session and ctrl:
+            if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+                pass  # → Ctrl+Tab block below
+            elif keyval == Gdk.KEY_Escape:
+                self._end_switch_session(cancel=True)
+                return True
+            elif keyval in (Gdk.KEY_Up, Gdk.KEY_KP_Up,
+                            Gdk.KEY_Left, Gdk.KEY_KP_Left):
+                self._switch_step(-1, reveal=True)
+                return True
+            elif keyval in (Gdk.KEY_Down, Gdk.KEY_KP_Down,
+                            Gdk.KEY_Right, Gdk.KEY_KP_Right):
+                self._switch_step(1, reveal=True)
+                return True
+            elif (keyval in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete)
+                    or latin_kv in (Gdk.KEY_w, Gdk.KEY_W)):
+                self._switch_close_index(self._switch_index)
+                return True
+            elif latin_kv in (Gdk.KEY_t, Gdk.KEY_T):
+                self._switch_add_tab()
+                return True
+            elif self._switcher is not None:
+                # With the list on screen Ctrl is held for the list, not for the
+                # tab under it — Ctrl+C here would interrupt whatever runs in a
+                # tab the user is only passing through.
+                return True
 
         # --- Tab list overlay navigation ---
         if self._tab_list_active:
@@ -1290,42 +1623,18 @@ class TerminalApp(Gtk.Application):
                 self.close_tab(t)
             return True
 
-        # Ctrl+Tab / Ctrl+Shift+Tab — MRU switching
+        # Ctrl+Tab / Ctrl+Shift+Tab — most-recently-used switching.  The first
+        # press opens a session (and arms the switcher's delay); later presses
+        # walk the session's order, Shift going backwards.
         if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
             if not self._ctrl_tab_armed:
                 return True  # ignore key-repeat
-            if len(self._mru_history) >= 2:
-                if not self._mru_frozen:
-                    self._mru_frozen = True
-                    self._mru_cycle_index = 1
-                    # Schedule tab list overlay after delay on first Ctrl+Tab
-                    if config.TAB_LIST_SHOW_ON_CTRL_TAB and not self._tab_list_active:
-                        self._tab_list_origin_page = self._notebook.get_current_page()
-                        if config.TAB_LIST_SHOW_ON_CTRL_TAB_DELAY <= 0:
-                            self._tab_list_active = True
-                            self._tab_list_selected = self._notebook.get_current_page()
-                            self._show_tab_list_overlay()
-                        elif not self._ctrl_tab_overlay_timer_id:
-                            self._ctrl_tab_overlay_timer_id = GLib.timeout_add(
-                                config.TAB_LIST_SHOW_ON_CTRL_TAB_DELAY,
-                                self._ctrl_tab_overlay_timer_fire)
-                else:
-                    self._mru_cycle_index += 1
-                    if self._mru_cycle_index >= len(self._mru_history):
-                        self._mru_cycle_index = 0
-                target = self._mru_history[self._mru_cycle_index]
-                page_num = self._notebook.page_num(target)
-                if page_num >= 0:
-                    self._notebook.set_current_page(page_num)
-                    GLib.idle_add(target.grab_terminal_focus)
-                # Sync tab list selection with MRU target
-                if self._tab_list_active:
-                    pg = self._notebook.page_num(target)
-                    if pg >= 0:
-                        self._tab_list_selected = pg
-                        self._move_tab_list_overlay_to(pg)
-                        self._update_tab_list_selection()
             self._ctrl_tab_armed = False
+            backward = shift or keyval == Gdk.KEY_ISO_Left_Tab
+            if self._switch_session:
+                self._switch_step(-1 if backward else 1)
+            else:
+                self._start_switch_session(backward)
             return True
 
         # Ctrl+Home / Ctrl+End — scroll to top/bottom of scrollback.
@@ -1386,7 +1695,9 @@ class TerminalApp(Gtk.Application):
 
         # Finalize tab switch when Ctrl is released
         if keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
-            # Cancel pending overlay timer (quick Ctrl+Tab released before delay)
+            # Ends a Ctrl+Tab session: takes the switcher down (or cancels its
+            # delay, for a quick tap) and commits the tab now shown.
+            self._end_switch_session()
             self._cancel_ctrl_tab_overlay_timer()
             # Close tab list overlay on Ctrl release (activate selected)
             if self._tab_list_active and config.TAB_LIST_ACTIVATE_ON_SELECT:
@@ -1405,18 +1716,232 @@ class TerminalApp(Gtk.Application):
                     GLib.idle_add(tab.grab_terminal_focus)
 
     def _ctrl_tab_overlay_timer_fire(self):
-        """GLib timer callback: show tab list overlay after delay."""
+        """The Ctrl+Tab delay ran out with Ctrl still down: show the switcher."""
         self._ctrl_tab_overlay_timer_id = 0
-        if self._mru_frozen and config.TAB_LIST_SHOW_ON_CTRL_TAB and not self._tab_list_active:
-            self._tab_list_active = True
-            # Sync selection with current MRU target (displayed tab)
-            target = self._get_visible_terminal()
-            if target:
-                page_idx = self._notebook.page_num(target)
-                if page_idx >= 0:
-                    self._tab_list_selected = page_idx
-            self._show_tab_list_overlay()
+        if self._switch_session:
+            self._show_switcher()
         return GLib.SOURCE_REMOVE
+
+    # ------------------------------------------------------------------
+    #  Ctrl+Tab switcher
+    # ------------------------------------------------------------------
+    def _build_switch_order(self):
+        """Every open tab, in the order Ctrl+Tab walks them.
+
+        The tab on screen first, then the MRU history, then any tab the history
+        never saw — so no tab is unreachable and none appears twice.  The shown
+        tab is put first explicitly rather than trusted to head the history: a
+        Ctrl+Left/Right walk freezes the history while it moves the view.
+        """
+        pages = [self._notebook.get_nth_page(i)
+                 for i in range(self._notebook.get_n_pages())]
+        order = []
+        cur = self._get_visible_terminal()
+        if cur is not None:
+            order.append(cur)
+        for tab in self._mru_history + pages:
+            if tab in pages and tab not in order:
+                order.append(tab)
+        return order
+
+    def _start_switch_session(self, backward):
+        # The right-hand list takes no part in Ctrl+Tab; it makes way.
+        if self._tab_list_active:
+            self._close_tab_list(activate=True)
+        order = self._build_switch_order()
+        if len(order) < 2:
+            return
+        self._switch_session = True
+        self._switch_order = order
+        self._switch_origin = order[0]
+        # A Ctrl+Left/Right walk in progress is taken over, not left half-open.
+        self._seq_switching = False
+        self._seq_origin_page = -1
+        self._mru_frozen = True
+        self._switch_index = len(order) - 1 if backward else 1
+        self._switch_apply()
+        if config.TAB_LIST_SHOW_ON_CTRL_TAB:
+            # The delay is what keeps a quick tap a plain flip to the previous
+            # tab: released before it runs out, nothing is ever drawn.
+            delay = config.TAB_LIST_SHOW_ON_CTRL_TAB_DELAY
+            if delay <= 0:
+                self._show_switcher()
+            elif not self._ctrl_tab_overlay_timer_id:
+                self._ctrl_tab_overlay_timer_id = GLib.timeout_add(
+                    delay, self._ctrl_tab_overlay_timer_fire)
+
+    def _switch_step(self, delta, reveal=False):
+        """Move the selection by `delta`, wrapping.  `reveal` brings the
+        switcher up at once — arrows are a deliberate walk, not a quick tap."""
+        n = len(self._switch_order)
+        if n == 0:
+            return
+        self._switch_index = (self._switch_index + delta) % n
+        self._switch_apply()
+        if reveal and self._switcher is None:
+            self._show_switcher()
+
+    def _switch_apply(self):
+        """Really switch to the selected tab, and mirror it in the switcher."""
+        if not self._switch_order:
+            return
+        self._switch_index = max(0, min(len(self._switch_order) - 1,
+                                        self._switch_index))
+        tab = self._switch_order[self._switch_index]
+        pg = self._notebook.page_num(tab)
+        if pg >= 0 and pg != self._notebook.get_current_page():
+            self._notebook.set_current_page(pg)
+        if self._switcher is not None:
+            self._switcher.set_selected(self._switch_index)
+
+    def _end_switch_session(self, cancel=False):
+        """Close the session.  `cancel` (Escape) returns to the starting tab;
+        otherwise the tab on screen is kept and becomes the most recent."""
+        if not self._switch_session:
+            return
+        self._cancel_ctrl_tab_overlay_timer()
+        self._hide_switcher()
+        origin = self._switch_origin
+        self._switch_session = False
+        self._switch_order = []
+        self._switch_index = 0
+        self._switch_origin = None
+        if cancel and origin is not None:
+            pg = self._notebook.page_num(origin)
+            if pg >= 0:
+                self._notebook.set_current_page(pg)
+        self._mru_frozen = False
+        cur = self._get_visible_terminal()
+        if cur is not None:
+            self._remember_tab(cur)
+            GLib.idle_add(cur.grab_terminal_focus)
+
+    def _on_win_active_changed(self, win, _pspec):
+        if win.is_active():
+            return
+        # The Ctrl and Tab releases will land in another window; see where this
+        # handler is connected.  Re-arm Ctrl+Tab too, or the next press after
+        # coming back would be swallowed as a key repeat.
+        self._end_switch_session()
+        self._ctrl_tab_armed = True
+
+    def _show_switcher(self):
+        self._cancel_ctrl_tab_overlay_timer()
+        if (not self._switch_session or self._switcher is not None
+                or self._win_overlay is None):
+            return
+        sw = TabSwitcher(on_select=self._on_switcher_select,
+                         on_close=self._on_switcher_close)
+        win_w = self._win.get_width() if self._win is not None else 0
+        win_h = self._win.get_height() if self._win is not None else 0
+        # Room for a title and a path side by side.  Never wider than the
+        # window, never taller than most of it.
+        width = int(min(615, max(420, win_w * 0.41))) if win_w > 0 else 480
+        if win_w > 0:
+            width = min(width, win_w - 40)
+        list_h = int(max(160, win_h * 0.62)) if win_h > 0 else 420
+        sw.set_limits(width, list_h)
+        sw.set_margin_top(max(40, int(win_h * 0.12)) if win_h > 0 else 60)
+        self._win_overlay.add_overlay(sw)
+        self._switcher = sw
+        sw.set_entries(self._switch_entries(), self._switch_index)
+
+    def _hide_switcher(self):
+        sw = self._switcher
+        if sw is None:
+            return
+        self._switcher = None
+        sw.dispose_pending()
+        if self._win_overlay is not None:
+            self._win_overlay.remove_overlay(sw)
+
+    def _switch_entries(self):
+        """Rows for the switcher, in session order."""
+        origin = self._switch_origin
+        out = []
+        for tab in self._switch_order:
+            pg = self._notebook.page_num(tab)
+            title = ""
+            if tab._tab_label is not None:
+                title = tab._tab_label.get_label() or ""
+            out.append({
+                "number": pg + 1,
+                "title": title or f"Terminal {pg + 1}",
+                "detail": self._tab_detail(tab),
+                "current": tab is origin,
+            })
+        return out
+
+    @staticmethod
+    def _tab_detail(tab):
+        """Second part of a switcher row: the tab's directory, ~-abbreviated.
+
+        Over ssh the local working directory is the ssh client's — true, but
+        it says nothing about where the session actually is — so the row is
+        left without one and the title, which names the host, speaks for it.
+        """
+        try:
+            pid = tab._get_foreground_process_pid()
+            if pid and pid > 0:
+                with open(f"/proc/{pid}/comm") as f:
+                    if f.read().strip() == "ssh":
+                        return ""
+        except OSError:
+            pass
+        try:
+            cwd = tab.get_cwd()
+        except Exception:
+            cwd = None
+        if not cwd:
+            return ""
+        home = os.path.expanduser("~")
+        if cwd == home or cwd.startswith(home + "/"):
+            return "~" + cwd[len(home):]
+        return cwd
+
+    def _switch_close_index(self, index):
+        """Close the tab on row `index` and keep the session going."""
+        if not (0 <= index < len(self._switch_order)):
+            return
+        # Never the last tab: closing it quits the application, which is not
+        # something to do by tapping Del in a list.
+        if self._notebook.get_n_pages() <= 1:
+            return
+        tab = self._switch_order.pop(index)
+        self.close_tab(tab)
+        self._switch_order = [t for t in self._switch_order
+                              if self._notebook.page_num(t) >= 0]
+        if not self._switch_order:
+            self._end_switch_session()
+            return
+        # Keep the highlight on the same tab when a row above it went; when the
+        # selected row itself went, the one that took its place is selected.
+        if index < self._switch_index:
+            self._switch_index -= 1
+        self._switch_apply()
+        if self._switcher is not None:
+            self._switcher.set_entries(self._switch_entries(), self._switch_index)
+
+    def _switch_add_tab(self):
+        """Ctrl+T during a session: open a tab and select it in the list."""
+        tab = self._add_tab()
+        if tab is None:
+            return
+        self._switch_order.append(tab)
+        self._switch_index = len(self._switch_order) - 1
+        self._switch_apply()
+        if self._switcher is not None:
+            self._switcher.set_entries(self._switch_entries(), self._switch_index)
+
+    def _on_switcher_select(self, index):
+        """Row clicked (Ctrl held): select it and really switch to it."""
+        if self._switch_session and 0 <= index < len(self._switch_order):
+            self._switch_index = index
+            self._switch_apply()
+
+    def _on_switcher_close(self, index):
+        if self._switch_session:
+            self._switch_close_index(index)
 
     def _cancel_ctrl_tab_overlay_timer(self):
         """Cancel pending delayed overlay timer if any."""
@@ -1518,222 +2043,69 @@ class TerminalApp(Gtk.Application):
             self._show_tab_list_overlay()
 
     def _show_tab_list_overlay(self):
-        """Build and show the tab list overlay widget."""
-        # Remove old overlay if any
+        """Build (or rebuild) the tab list popup under the tab bar."""
         self._hide_tab_list_overlay()
-
         n = self._notebook.get_n_pages()
-        if n == 0:
+        if n == 0 or self._win_overlay is None:
             return
-
         cur_page = self._notebook.get_current_page()
-
-        # The rows go in a plain box, which is then wrapped in a scroller: with
-        # enough tabs open the box grows taller than the window, and an overlay
-        # child is simply clipped at the window edge — the bottom entries used
-        # to be unreachable with the mouse.  The scroller caps the height and
-        # takes over from there.
-        row_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-
-        overlay_box = Gtk.ScrolledWindow()
-        overlay_box.set_child(row_box)
-        overlay_box.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        # Natural height, so a short list is still a short popup and only a
-        # long one starts scrolling.
-        overlay_box.set_propagate_natural_height(True)
-        overlay_box.set_max_content_height(self._tab_list_max_height())
-        # The bar takes layout space instead of floating over the last column of
-        # the titles, and it is styled as part of the popup (see the CSS) rather
-        # than left as a second system scrollbar next to the terminal's own.
-        overlay_box.set_overlay_scrolling(False)
-        overlay_box.add_css_class("tab-list-overlay")
-        overlay_box.set_halign(Gtk.Align.END)
-        overlay_box.set_valign(Gtk.Align.START)
-        overlay_box.set_margin_end(20)
-        overlay_box.set_margin_top(4)
-        overlay_box.set_margin_bottom(4)
-
-        self._tab_list_buttons = []
-        # During MRU/sequential switching, mark the origin tab as "active"
-        # (where user started) instead of the currently displayed tab.
+        # During a Ctrl+Left/Right walk the tab on screen is not where the user
+        # started from; the ✓ stays on the starting tab.
         active_page = self._tab_list_origin_page if self._mru_frozen else cur_page
+        entries = []
         for i in range(n):
             tab = self._notebook.get_nth_page(i)
-            title = f"Terminal {i + 1}"
-            if tab._tab_label:
-                title = tab._tab_label.get_label() or title
+            title = ""
+            if tab._tab_label is not None:
+                title = tab._tab_label.get_label() or ""
+            entries.append({
+                "number": i + 1,
+                "title": title or f"Terminal {i + 1}",
+                "detail": self._tab_detail(tab),
+                "current": i == active_page,
+            })
+        popup = TabListPopup(on_select=self._on_tab_list_select,
+                             on_close=self._on_tab_list_close)
+        win_w = self._win.get_width() if self._win is not None else 0
+        win_h = self._win.get_height() if self._win is not None else 0
+        # Narrower than the reference design: a title and a short path.
+        width = int(min(560, max(380, win_w * 0.36))) if win_w > 0 else 460
+        if win_w > 0:
+            width = min(width, win_w - 24)
+        top = self._tab_bar_height()
+        list_h = max(120, win_h - top - 24) if win_h > 0 else 480
+        popup.set_limits(width, list_h)
+        popup.set_margin_top(top + 2)
+        popup.set_margin_end(8)
+        self._win_overlay.add_overlay(popup)
+        self._tab_list_popup = popup
+        popup.set_entries(entries, self._tab_list_selected)
 
-            btn = Gtk.Button(label=title)
-            btn.set_has_frame(False)
-            btn.add_css_class("tab-list-item")
-            if i == active_page:
-                btn.add_css_class("tab-list-item-active")
-            if i == self._tab_list_selected:
-                btn.add_css_class("tab-list-item-selected")
-            btn.connect("clicked", self._on_tab_list_item_clicked, i)
-            row_box.append(btn)
-            self._tab_list_buttons.append(btn)
+    def _tab_bar_height(self):
+        """Where the tab bar ends, in window-overlay coordinates.
 
-        # Add overlay to the current tab's overlay container
-        tab = self._notebook.get_nth_page(cur_page)
-        if tab and hasattr(tab, '_overlay'):
-            tab._overlay.add_overlay(overlay_box)
-            self._tab_list_overlay_widget = overlay_box
-            self._tab_list_overlay_parent = tab._overlay
-            # A pending scroll is retried from here as well as from the idle
-            # callback.  "changed" fires when the adjustment gets its lower/upper/
-            # page-size, which happens during allocation — that is the first
-            # moment the row offsets mean anything, and it can land after the
-            # idle has already run and given up.
-            _vadj = overlay_box.get_vadjustment()
-            if _vadj is not None:
-                _vadj.connect("changed", self._on_tab_list_adj_changed)
-            # Open scrolled to the selected tab — with many tabs the current one
-            # is usually well below the fold, and a list that opens at the top
-            # hides the very row the user came to look at.
-            self._queue_tab_list_scroll()
-
-    def _tab_list_max_height(self):
-        """Height cap for the tab list, derived from the window.
-
-        A fixed number would either waste space on a tall window or overflow a
-        short one.  The margins are the overlay's own (top/bottom) plus room for
-        the tab bar it hangs under.
+        The list hangs just under it.  Measured from the page itself rather
+        than assumed, so another theme or font size cannot leave the list
+        overlapping the tabs.
         """
-        try:
-            win_h = self._win.get_height()
-        except Exception:
-            win_h = 0
-        if win_h <= 0:
-            return 480
-        return max(120, win_h - 80)
-
-    def _queue_tab_list_scroll(self):
-        """Bring the selected row into view once the overlay has been laid out.
-
-        Deferred: right after the overlay is built — or re-parented onto another
-        tab for preview — the scroller has no allocation yet, so its adjustment
-        reports a page size of 0 and any offset computed now would be
-        meaningless.  Coalesced to one pending callback, because holding
-        Ctrl+Tab down would otherwise queue one per keypress.
-
-        The request stays pending until it actually succeeds.  An idle callback
-        is not a promise that layout has happened — all pending idles run before
-        the frame that allocates the scroller, so the first attempt on a freshly
-        built overlay usually finds a page size of 0.  That is why the list only
-        *sometimes* opened on the active tab: whether it worked came down to
-        whether an unrelated frame had already sized the widget.
-        """
-        self._tab_list_scroll_pending = True
-        self._tab_list_scroll_tries = 0
-        if self._tab_list_scroll_id:
-            return
-        self._tab_list_scroll_id = GLib.idle_add(self._tab_list_scroll_idle)
-
-    def _tab_list_scroll_idle(self):
-        self._tab_list_scroll_id = 0
-        self._try_tab_list_scroll()
-        return GLib.SOURCE_REMOVE
-
-    def _on_tab_list_adj_changed(self, _adj):
-        """Geometry arrived — finish the pending scroll, but from an idle.
-
-        Not done inline.  "changed" is emitted from inside the ScrolledWindow's
-        own size-allocate, and a value written there does not survive: the rest
-        of that allocation re-clamps the adjustment and the scroll is silently
-        undone.  An idle added here runs after the frame completes — the frame
-        clock outranks default idles, so it cannot cut in mid-layout — and the
-        write sticks.
-        """
-        if not self._tab_list_scroll_pending or self._tab_list_scroll_id:
-            return
-        self._tab_list_scroll_id = GLib.idle_add(self._tab_list_scroll_idle)
-
-    def _try_tab_list_scroll(self):
-        """Scroll to the selection, clearing the request only on success.
-
-        Two things about layout timing bite here, and both had to be handled:
-
-        The offset is derived from the adjustment and the row count rather than
-        by measuring the selected button.  Measuring looked simpler but cannot
-        work from "changed": that signal arrives in the middle of the layout pass
-        — the scroller already knows its own geometry while the rows inside it
-        have not been placed — so compute_bounds() returns a stale rectangle.
-        Every row here is a one-line Gtk.Button with identical padding, so
-        upper/count is the row height exactly and no child allocation is needed.
-
-        And this must never run *from* "changed", only from the idle it queues:
-        a value written during the ScrolledWindow's size-allocate is re-clamped
-        by the remainder of that same allocation, so the scroll would be computed
-        correctly and then quietly thrown away.
-        """
-        scroller = getattr(self, '_tab_list_overlay_widget', None)
-        buttons = getattr(self, '_tab_list_buttons', [])
-        idx = self._tab_list_selected
-        if scroller is None or not (0 <= idx < len(buttons)):
-            self._tab_list_scroll_pending = False
-            return
-        adj = scroller.get_vadjustment()
-        if adj is None:
-            self._tab_list_scroll_pending = False
-            return
-        page = adj.get_page_size()
-        upper = adj.get_upper()
-        if page <= 0 or upper <= 0:
-            return              # not laid out yet — stay pending and retry
-        if upper <= page:
-            self._tab_list_scroll_pending = False   # whole list fits
-            return
-
-        row_h = upper / len(buttons)
-        top = idx * row_h
-        bottom = top + row_h
-        value = adj.get_value()
-        # Keep a sliver of the neighbouring row visible: that edge is what shows
-        # there is more list past the selection.
-        margin = min(6.0, row_h / 2)
-        target = value
-        if top - margin < value:
-            target = max(0.0, top - margin)
-        elif bottom + margin > value + page:
-            target = min(upper - page, bottom + margin - page)
-
-        if target != value:
-            adj.set_value(target)
-            # Read it back rather than assuming.  The whole reason this was hard
-            # is that a write can be silently discarded, and clearing the request
-            # on an assumption is what left the selection off-screen.
-            if abs(adj.get_value() - target) > 0.5:
-                # Geometry is already good here, so "changed" may never fire
-                # again to trigger a retry — re-arm one ourselves.  Bounded,
-                # because the target is clamped into range before the write and
-                # therefore reachable: if it keeps failing, something is wrong
-                # that spinning will not fix, and an off-screen row beats a
-                # busy loop.
-                self._tab_list_scroll_tries += 1
-                if (self._tab_list_scroll_tries < 8
-                        and not self._tab_list_scroll_id):
-                    self._tab_list_scroll_id = GLib.idle_add(
-                        self._tab_list_scroll_idle)
-                else:
-                    self._tab_list_scroll_pending = False
-                return
-        self._tab_list_scroll_pending = False
+        page = self._get_visible_terminal()
+        if page is not None and self._win_overlay is not None:
+            try:
+                ok, rect = page.compute_bounds(self._win_overlay)
+                if ok and rect.origin.y > 0:
+                    return int(rect.origin.y)
+            except Exception:
+                pass
+        return 34
 
     def _hide_tab_list_overlay(self):
-        """Remove tab list overlay widget."""
-        if self._tab_list_scroll_id:
-            GLib.source_remove(self._tab_list_scroll_id)
-            self._tab_list_scroll_id = 0
-        self._tab_list_scroll_pending = False
-        self._tab_list_scroll_tries = 0
-        widget = getattr(self, '_tab_list_overlay_widget', None)
-        parent = getattr(self, '_tab_list_overlay_parent', None)
-        if widget and parent:
-            parent.remove_overlay(widget)
-        self._tab_list_overlay_widget = None
-        self._tab_list_overlay_parent = None
-        self._tab_list_buttons = []
+        popup = self._tab_list_popup
+        if popup is None:
+            return
+        self._tab_list_popup = None
+        popup.dispose_pending()
+        if self._win_overlay is not None:
+            self._win_overlay.remove_overlay(popup)
 
     def _close_tab_list(self, activate=False):
         """Close tab list overlay.
@@ -1766,66 +2138,107 @@ class TerminalApp(Gtk.Application):
                     GLib.idle_add(tab.grab_terminal_focus)
 
     def _update_tab_list_selection(self):
-        """Update visual selection in tab list overlay."""
-        for i, btn in enumerate(getattr(self, '_tab_list_buttons', [])):
-            if i == self._tab_list_selected:
-                btn.add_css_class("tab-list-item-selected")
-            else:
-                btn.remove_css_class("tab-list-item-selected")
-        # Follow the selection with the scroll, or Ctrl+Tab past the visible
-        # rows would move the highlight somewhere the user cannot see.
-        self._queue_tab_list_scroll()
-        # Preview: switch to selected tab and move overlay to new tab
+        """Move the list's highlight to _tab_list_selected, and preview it."""
+        if self._tab_list_popup is not None:
+            self._tab_list_popup.set_selected(self._tab_list_selected)
         if config.TAB_LIST_PREVIEW:
             idx = self._tab_list_selected
-            n = self._notebook.get_n_pages()
-            if 0 <= idx < n:
-                self._move_tab_list_overlay_to(idx)
+            if 0 <= idx < self._notebook.get_n_pages():
                 self._notebook.set_current_page(idx)
 
-    def _move_tab_list_overlay_to(self, page_idx):
-        """Move tab list overlay widget to a different tab's overlay."""
-        widget = self._tab_list_overlay_widget
-        old_parent = self._tab_list_overlay_parent
-        if not widget:
+    def _on_tab_list_select(self, page_idx):
+        """Row clicked: pick that tab and close the list."""
+        if not self._tab_list_active:
             return
-        new_tab = self._notebook.get_nth_page(page_idx)
-        if not new_tab or not hasattr(new_tab, '_overlay'):
-            return
-        new_parent = new_tab._overlay
-        if new_parent is old_parent:
-            return  # already on the right tab
-        # Detach from old parent, attach to new
-        if old_parent:
-            old_parent.remove_overlay(widget)
-        new_parent.add_overlay(widget)
-        self._tab_list_overlay_parent = new_parent
-
-    def _on_tab_list_item_clicked(self, btn, page_idx):
-        """Switch to tab from tab list and close overlay."""
         self._tab_list_selected = page_idx
         self._close_tab_list(activate=True)
 
-    def _on_close(self, win):
-        """Show bottom confirm bar before closing the window (multiple tabs)."""
+    def _on_tab_list_close(self, page_idx):
+        """× on a row: close that tab and keep the list open."""
+        if not self._tab_list_active:
+            return
         n = self._notebook.get_n_pages()
-        if n <= 1:
+        # Never the last tab: closing it quits the application, which is not
+        # something a click in a list should do.
+        if not (0 <= page_idx < n) or n <= 1:
+            return
+        self.close_tab(self._notebook.get_nth_page(page_idx))
+        n = self._notebook.get_n_pages()
+        # Rows below the closed one moved up; keep the highlight and the ✓ on
+        # the same tabs.
+        if page_idx < self._tab_list_selected:
+            self._tab_list_selected -= 1
+        if page_idx < self._tab_list_origin_page:
+            self._tab_list_origin_page -= 1
+        self._tab_list_selected = max(0, min(self._tab_list_selected, n - 1))
+        self._tab_list_origin_page = max(0, min(self._tab_list_origin_page, n - 1))
+        self._show_tab_list_overlay()
+        self._update_tab_list_selection()
+
+    def _on_close(self, win):
+        """Window close: with more than one tab open, ask first.
+
+        The question used to be a bar along the bottom of the terminal, easy to
+        take for one more line of output.  It is a card over the dimmed window
+        now (popups.ConfirmPopup), in the same style as the tab popups.
+        """
+        n = self._notebook.get_n_pages()
+        if n <= 1 or self._win_overlay is None:
             self._do_close()
             return False
+        if self._close_confirm is not None:
+            return True                     # already asking
+        # Nothing else stays open under the question.
+        self._end_switch_session()
+        if self._tab_list_active:
+            self._close_tab_list(activate=True)
 
-        # Show confirm bar on the active tab — same style as dangerous-command bar
-        tab = self._get_visible_terminal()
-        if tab is None:
+        busy = self._busy_tab_lines()
+        msg = f"Открыто вкладок: {n}. Все они закроются вместе с окном."
+        if busy:
+            msg += " В этих вкладках сейчас что-то выполняется, оно будет прервано:"
+        popup = ConfirmPopup("Закрыть окно", msg, busy, "Закрыть всё",
+                             self._on_close_answer)
+        self._win_overlay.add_overlay(popup)
+        self._close_confirm = popup
+        return True  # suppress default close — wait for the answer
+
+    def _busy_tab_lines(self, limit=8):
+        """One line per tab whose foreground process is not its shell.
+
+        That is what closing actually costs — an idle shell loses nothing, an
+        ansible run or an ssh session does — so it is worth naming.
+        """
+        lines = []
+        for i in range(self._notebook.get_n_pages()):
+            tab = self._notebook.get_nth_page(i)
+            child = getattr(tab, "_child_pid", 0) or 0
+            try:
+                pid = tab._get_foreground_process_pid()
+            except Exception:
+                continue
+            if not pid or pid <= 0 or child <= 0 or pid == child:
+                continue
+            title = ""
+            if tab._tab_label is not None:
+                title = tab._tab_label.get_label() or ""
+            lines.append(f"{i + 1}.  {title}")
+        if len(lines) > limit:
+            rest = len(lines) - (limit - 1)
+            lines = lines[:limit - 1] + [f"… и ещё {rest}"]
+        return lines
+
+    def _on_close_answer(self, accepted):
+        popup = self._close_confirm
+        self._close_confirm = None
+        if popup is not None and self._win_overlay is not None:
+            self._win_overlay.remove_overlay(popup)
+        if accepted:
             self._do_close()
-            return False
-
-        self._close_confirm_pending = True
-        msg = f"⚠  Close all {n} tabs and quit?  [Enter = quit, Esc = cancel]"
-        tab._confirm_bar.set_label(msg)
-        tab._sync_overlay_margins()  # ensure margin is up-to-date before showing
-        tab._confirm_bar.set_visible(True)
-        tab.terminal.grab_focus()  # keep focus for Esc
-        return True  # suppress default close — wait for confirm
+            return
+        cur = self._get_visible_terminal()
+        if cur is not None:
+            cur.grab_terminal_focus()
 
     def _do_close(self):
         """Actually clean up all tabs and quit."""
